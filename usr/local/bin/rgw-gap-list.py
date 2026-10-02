@@ -2,7 +2,7 @@
 
 """
 By: Michael J. Kidd (linuxkidd)
-Last Revision: 2026-10-01
+Last Revision: 2026-10-02
 Version: 4.0
 
 Now storing results in RADOS
@@ -85,8 +85,6 @@ from typing import List, Dict, Optional, Tuple, Union
 import rados
 
 LOG_LEVELS = [ 50, 30, 20, 10 ]
-MYPID = os.getpid()
-MYHOST = os.uname().nodename
 
 def signal_handler(sig: int, _frame: Optional[FrameType]) -> None:
     print(f'Received {sig}, Terminating')
@@ -169,9 +167,21 @@ class CephClusterConnection:
             logger.info("Connection to the Ceph cluster closed.")
 
     def null_cb(self, *extra_args) -> None:
+        """ 
+        A null callback for aio stat commands.  The callback doesn't contain anything
+        useful for our purposes.
+        """
         return None
 
     def async_stat_datapool_object(self, object_name: str = "", idx: Optional[int] = None) -> List:
+        """
+        Perform an asynchronous stat command to the RADOS data pool(s) to check if the object exists.
+        Since there can be many data baring pools ( even by default, `.data` and `.non-ec` )
+        Based on the value of the idx variable passed to the function, it will selectively check:
+        - None: all data pools
+        - 0: First data pool only
+        - >=1: Stat all pools from this index and all remaining pools.
+        """
         if not self.cluster:
             logger.critical("Cluster is not connected.")
             raise RuntimeError("Cluster is not connected.")
@@ -184,24 +194,23 @@ class CephClusterConnection:
         if idx is not None:
             if idx == 0:
                 idxend = 1
-            else:
-                idxstart = 1
+            elif idx >= 1:
+                idxstart = idx
 
         for myidx in range(idxstart,idxend):
-            try:
-                stat_ops.append(self.pool_ioctl[myidx].aio_stat(object_name,self.null_cb))
-            except rados.ObjectNotFound as e:
-                logger.error("[Exception] Object not found %s: %s", object_name, e)
+            stat_ops.append(self.pool_ioctl[myidx].aio_stat(object_name,self.null_cb))
 
         return stat_ops
 
     def write_syncpool_object_data(self, object_name: str = "", contents: Union[str,bytes] = "") -> None:
+        """ Write data to an object in the sync pool. """
         try:
             self.sync_ioctl.write_full(object_name, contents.encode("utf-8"))
         except AttributeError:
             self.sync_ioctl.write_full(object_name, contents)
 
     def read_syncpool_object_data(self, object_name: str = "") -> Union[ Dict, str ]:
+        """ Read data from an object in the sync pool """
         data = self.sync_ioctl.read(object_name).decode("utf-8")
         try:
             return json.loads(data)
@@ -209,6 +218,7 @@ class CephClusterConnection:
             return data
 
     def stat_syncpool_object(self, object_name: str = "") ->  bool:
+        """ Synchronous stat of an object in the sync pool """
         try:
             self.sync_ioctl.stat(object_name)
             logger.debug("[STAT] Object exists: %s", object_name)
@@ -218,6 +228,7 @@ class CephClusterConnection:
             return False
 
     def remove_syncpool_object(self, object_name: str = "") -> None:
+        """ Remove an object in the sync pool """
         try:
             self.sync_ioctl.remove_object(object_name)
             logger.debug("Removed %s", object_name)
@@ -225,11 +236,13 @@ class CephClusterConnection:
             logger.debug("Removal unnecesary, object %s not present.", object_name)
 
     def write_syncpool_omap(self, object_name: str = "", key_name: str = "", contents: str = "") -> None:
+        """ Write omap to an object in the sync pool. """
         with rados.WriteOpCtx() as write_op:
             self.sync_ioctl.set_omap(write_op,(key_name, ),( contents, ))
             self.sync_ioctl.operate_write_op(write_op, object_name)
 
     def read_syncpool_omap_vals(self, object_name: str) -> Dict:
+        """ Read all omap key/value pairs from an object in the sync pool """
         kvdata = {}
         last_omap_key = ""
         batch_size = 5000
@@ -273,6 +286,7 @@ class CephClusterConnection:
         return kvdata
 
     def read_syncpool_omap_vals_by_keys(self, object_name: str = "", key_list: Tuple = () ) -> Dict:
+        """ Return the omap key, value pair(s) for a given object and key(s) in the sync pool """
         results = {}
         with rados.ReadOpCtx() as read_op:
             omap_iterator, _ret = self.sync_ioctl.get_omap_vals_by_keys(read_op, key_list)
@@ -286,6 +300,7 @@ class CephClusterConnection:
         return results
 
     def remove_syncpool_omap_keys(self, object_name: str = "", key_list: List = None) -> None:
+        """ Remove omap key, value pair(s) from a given object in the sync pool """
         if not isinstance(key_list,List):
             return
 
@@ -299,6 +314,11 @@ class CephClusterConnection:
 # End class CephClusterConnection
 
 class CephGapScanner:
+    """
+    A class to handle scanning a validating data consistency between the RADOS Gateway bucket index
+    and the backing data pools.  Specifically, it checks that all RADOS objects referenced in the 
+    bucket index exist in RADOS.
+    """
     def __init__(self, localceph: CephClusterConnection) -> None:
         self.ceph = localceph
         self.shard_count = 1
@@ -316,8 +336,8 @@ class CephGapScanner:
         self.json = False
         self.skipped_bucket_count = 0
         self.in_flight = deque()
-        self.MYHOST=""
-        self.MYPID=0
+        self.MYPID = os.getpid()
+        self.MYHOST = os.uname().nodename
 
         self.FIELD_SEPARATOR = "\xfe"
         self.BUCKET_LIST_COMMAND = ["radosgw-admin", "bucket", "list"]
@@ -462,7 +482,7 @@ class CephGapScanner:
         sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "rados_obj_count": rados_obj_count,
                         "gap_count": gap_count, "bucket_counter": self.processed_bucket_count,
                         "total_buckets": self.total_bucket_count, "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
-        self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{MYHOST}.{MYPID}" , json.dumps(sync_state))
+        self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{self.MYHOST}.{self.MYPID}" , json.dumps(sync_state))
 
     def rm_sync_state(self) -> None:
         self.ceph.remove_syncpool_omap_keys(self.SYNC_OBJECT_NAME, [ f"{self.MYHOST}.{self.MYPID}" ])
@@ -471,7 +491,7 @@ class CephGapScanner:
         self.delete_gap_objects([ bucket_name ])
         shardid = self.hash_bucket_name(bucket_name)
         logger.debug("Setting bucket start metadata to sync shard %i", shardid)
-        sync_metadata = { "hostname": MYHOST, "pid": MYPID, "rados_obj_count": 0, "gap_count": 0,
+        sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "rados_obj_count": 0, "gap_count": 0,
                          "start_time": round(time.time(),3), "end_time": 0, "match": match }
         self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(sync_metadata))
         self.touch_sync_state(bucket_name,0,0)
@@ -518,7 +538,7 @@ class CephGapScanner:
         running_hosts_raw = self.ceph.read_syncpool_omap_vals(self.SYNC_OBJECT_NAME)
 
         for key, value in running_hosts_raw.items():
-            if key == f"{MYHOST}.{MYPID}":
+            if key == f"{self.MYHOST}.{self.MYPID}":
                 continue
             key_parts = key.strip().split(".")
             rhost = key_parts[0]
@@ -713,7 +733,7 @@ class CephGapScanner:
         days = int(secs // 86400)
         hours = int((secs % 86400) // 3600)
         minutes = int((secs % 3600) // 60)
-        seconds = secs % 60
+        seconds = round(secs % 60,3)
         parts = []
         if days:
             parts.append(f"{days} d")
@@ -882,22 +902,23 @@ class CephGapScanner:
                         else:
                             self.skipped_bucket_count += 1
                             logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
+            return None
 
-        else: # Randomize the bucket list, this is the default.
-            with subprocess.Popen(self.BUCKET_LIST_COMMAND, bufsize=1048576, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as bl, \
-                subprocess.Popen(["jq","-cr",".[]"],stdin=bl.stdout,stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as jql, \
-                subprocess.Popen(["sort","--random-sort"],stdin=jql.stdout,stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as sortl:
+        # Randomize the bucket list, this is the default.
+        with subprocess.Popen(self.BUCKET_LIST_COMMAND, bufsize=1048576, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as bl, \
+            subprocess.Popen(["jq","-cr",".[]"],stdin=bl.stdout,stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as jql, \
+            subprocess.Popen(["sort","--random-sort"],stdin=jql.stdout,stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as sortl:
 
-                bl.stdout.close()
-                jql.stdout.close()
+            bl.stdout.close()
+            jql.stdout.close()
 
-                for sortl_line in io.TextIOWrapper(sortl.stdout, encoding="utf-8"):
-                    bucket = sortl_line.strip()
-                    if bucket not in exclude_bucket_list:
-                        self.process_bucket(bucket)
-                    else:
-                        self.skipped_bucket_count += 1
-                        logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
+            for sortl_line in io.TextIOWrapper(sortl.stdout, encoding="utf-8"):
+                bucket = sortl_line.strip()
+                if bucket not in exclude_bucket_list:
+                    self.process_bucket(bucket)
+                else:
+                    self.skipped_bucket_count += 1
+                    logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
 
         return None
 
@@ -918,7 +939,7 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--norandom", default = False, action="store_true", help="By default, the script randomizes the list of buckets before processing.  On large bucket count environments, this may cause significant delay before start of processing due to the way the randomizing occurs.  Set '-n' to Not Randomize the list to remove this delay.")
     parser.add_argument("--namespace", default = 'rgw-gap-list', help="What namespace to use for sync / results objects. Default: rgw-gap-list")
     parser.add_argument("-p", "--pool", default = 'default.rgw.buckets.data default.rgw.buckets.non-ec', help="Bucket Data Pool(s), default 'default.rgw.buckets.data default.rgw.buckets.non-ec', quoted space separated list is supported.")
-    parser.add_argument("-s", "--syncpool", default = 'default.rgw.buckets.index', help="Synchronization / Queuing pool for the script ot use, default 'default.rgw.buckets.index'.")
+    parser.add_argument("-s", "--syncpool", default = 'default.rgw.buckets.index', help="Synchronization / Queuing pool for the script to use, default 'default.rgw.buckets.index'.")
     parser.add_argument("-r", "--report",  default = False, action="store_true", help="Generate bucket scrub metadata report.")
     parser.add_argument("-j", "--json",  default = False, action="store_true", help="Use JSON format for bucket scrub metadata report. Only considered with -g, -r and -x")
     parser.add_argument("-v", "--verbosity", default = 0, action="count", help="Optional: Verbosity level, multiple -v's are supported for higher verbosity, example: -vvv")
@@ -929,7 +950,7 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=LOG_LEVELS[debug_level],
-        format=f'%(asctime)s {MYHOST}.{MYPID} %(levelname)s - %(message)s',
+        format=f'%(asctime)s {os.getpid()}.{os.uname().nodename} %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler()
         ]
@@ -971,8 +992,7 @@ if __name__ == "__main__":
             scanner.match = args.match
             scanner.max_age = max(0,int(args.maxage))
             scanner.json = args.json
-            scanner.MYHOST = MYHOST
-            scanner.MYPID = MYPID
+
             if args.gaps:
                 scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
             elif args.report:
