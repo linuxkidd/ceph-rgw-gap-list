@@ -1,0 +1,38 @@
+# usage: rgw-gap-list.py [-h] [-a MAXAGE] [-b BUCKETLIST] [-e EXCLUDELIST] [-f EXCLUDEFILE] [-c CONF] [-d] [-g] [-i INFLIGHT] [-l LISTFILE] [-m MATCH] [-n] [--namespace NAMESPACE] [-p POOL] [-s SYNCPOOL]
+#                        [-r] [-j] [-v] [-x]
+# 
+# Multi-run / Multi-host capable rgw-gap-list tool
+# 
+# optional arguments:
+#   -h, --help            show this help message and exit
+#   -a MAXAGE, --maxage MAXAGE
+#                         Maximum age (in seconds) of last scan before rescan is forced. Default 7 days.
+#   -b BUCKETLIST, --bucketlist BUCKETLIST
+#                         Optional: Bucket(s) to operate on, default is all buckets, quoted space separated list is supported. Supercedes -l.
+#   -e EXCLUDELIST, --excludelist EXCLUDELIST
+#                         Optional: Bucket(s) to skip, default is process all buckets, quoted space separated list is supported. Supercedes -f.
+#   -f EXCLUDEFILE, --excludefile EXCLUDEFILE
+#                         Optional: File with list of bucket(s) to skip, should be one bucket name per line.
+#   -c CONF, --conf CONF  Ceph conf file to use, default '/etc/ceph/ceph.conf'
+#   -d, --delete          Remove all sync objects and Exit. Used to clear all syncronized bucket status data.
+#   -g, --gaps            Dump the gap results from RADOS object contents. All other options are ignore ( except -j )
+#   -i INFLIGHT, --inflight INFLIGHT
+#                         Maximum number of in-flight ops to allow without a response. Default: 15000
+#   -l LISTFILE, --listfile LISTFILE
+#                         Optional: Bucket list file, should be one bucket name per line.
+#   -m MATCH, --match MATCH
+#                         Specify a prefix match for the object names. Only objects matching this prefix will be checked for gaps.
+#   -n, --norandom        By default, the script randomizes the list of buckets before processing. On large bucket count environments, this may cause significant delay before start of processing due to
+#                         the way the randomizing occurs. Set '-n' to Not Randomize the list to remove this delay.
+#   --namespace NAMESPACE
+#                         What namespace to use for sync / results objects. Default: rgw-gap-list
+#   -p POOL, --pool POOL  Bucket Data Pool(s), default 'default.rgw.buckets.data default.rgw.buckets.non-ec', quoted space separated list is supported.
+#   -s SYNCPOOL, --syncpool SYNCPOOL
+#                         Synchronization / Queuing pool for the script ot use, default 'default.rgw.buckets.index'.
+#   -r, --report          Generate bucket scrub metadata report.
+#   -j, --json            Use JSON format for bucket scrub metadata report. Only considered with -g, -r and -x
+#   -v, --verbosity       Optional: Verbosity level, multiple -v's are supported for higher verbosity, example: -vvv
+#   -x, --verify          Used to verify the results from a prior run.
+#
+
+OPTS="" 

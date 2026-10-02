@@ -1,0 +1,25 @@
+[Unit]
+Description=Run rgw-gap-list@.service on a schedule
+
+[Timer]
+# 1st and 15th Example
+OnCalendar=*-*-1,15 04:00:00
+
+# Examples:
+# ---------
+
+# Monthly:
+# ====================================
+# OnCalendar=*-*-1 04:00:00
+
+# Exactly every two weeks, at least one hour after boot:
+# ====================================
+# OnBootSec=1h
+# OnUnitActiveSec=2w
+
+# Weekly
+# ====================================
+# OnCalendar=Mon *-*-* 00:00:00
+
+[Install]
+WantedBy=multi-user.target
