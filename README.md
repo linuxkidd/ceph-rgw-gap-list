@@ -67,6 +67,7 @@ The available options include:
 - `-b BUCKETLIST`: Bucket(s) to operate on (space-separated list)
 - `-e EXCLUDELIST`: Bucket(s) to skip (space-separated list)
 - `-f EXCLUDEFILE`: File with list of buckets to skip
+- `-i INFLIGHT`: The maximum number of asynchronous RADOS stat options to allow to be in flight
 - `-p POOL`: Bucket Data Pool(s) to use
 - `-s SYNCPOOL`: Synchronization pool to use
 - `-v`: Verbosity level (multiple -v's for higher verbosity - up to 3 maximum)
