@@ -76,19 +76,19 @@ import json
 import logging
 import os
 import re
-import rados
 import signal
 import subprocess
 import sys
 import time
 from types import FrameType
 from typing import List, Dict, Optional, Tuple, Union
+import rados
 
 LOG_LEVELS = [ 50, 30, 20, 10 ]
 MYPID = os.getpid()
 MYHOST = os.uname().nodename
 
-def signal_handler(sig: int, frame: Optional[FrameType]) -> None:
+def signal_handler(sig: int, _frame: Optional[FrameType]) -> None:
     print(f'Received {sig}, Terminating')
     sys.exit(1)
 
@@ -100,7 +100,9 @@ class CephClusterConnection:
     A context manager to handle connecting to and disconnecting from a
     Ceph RADOS cluster, ensuring resources are cleaned up properly.
     """
-    def __init__(self, ceph_conf: str = '/etc/ceph/ceph.conf', pool_names: List = [], sync_pool: str = '') -> None:
+    def __init__(self, ceph_conf: str = '/etc/ceph/ceph.conf',
+                 pool_names: List = None,
+                 sync_pool: str = None) -> None:
         self.ceph_conf = ceph_conf
         self.cluster = None
         self.pool_names = pool_names
@@ -116,34 +118,34 @@ class CephClusterConnection:
             self.cluster.connect()
             logger.info("Successfully connected to the Ceph cluster.")
         except rados.Error as e:
-            logger.critical(f"Failed to connect to the Ceph cluster: {e}")
-            raise RuntimeError(f"Failed to connect to the Ceph cluster: {e}")
+            logger.critical("Failed to connect to the Ceph cluster: %s", e)
+            raise RuntimeError(f'Failed to connect to the Ceph cluster: {e}') from e
 
-        logger.info(f"Opening ioctl for sync pool {self.sync_pool}")
+        logger.info("Opening ioctl for sync pool %s", self.sync_pool)
         try:
             self.sync_ioctl = self.cluster.open_ioctx(self.sync_pool)
         except rados.ObjectNotFound:
-            logger.critical(f"Sync Pool {self.sync_pool} not present.  Exiting.")
-            exit(1)
+            logger.critical("Sync Pool %s not present.  Exiting.", self.sync_pool)
+            sys.exit(1)
         else:
             if len(self.namespace) > 0:
                 self.sync_ioctl.set_namespace(self.namespace)
 
         for pool_name in self.pool_names:
-            logger.info(f"Opening ioctl for pool {pool_name}")
+            logger.info("Opening ioctl for pool %s", pool_name)
             try:
                 self.pool_ioctl.append(self.cluster.open_ioctx(pool_name))
             except rados.ObjectNotFound:
-                logger.error(f"Pool {pool_name} not present, skipping.")
+                logger.error("Pool %s not present, skipping.", pool_name)
             else:
                 if re.search(r"\.non-ec$",pool_name):
-                    logger.info(f"Pool {pool_name}, adding namespace 'multipart'")
+                    logger.info("Pool %s, adding namespace 'multipart'", pool_name)
                     self.pool_ioctl.append(self.cluster.open_ioctx(pool_name))
                     self.pool_ioctl[len(self.pool_ioctl)-1].set_namespace('multipart')
 
         if len(self.pool_ioctl)==0:
-            logger.critical(f"None of the listed pools exist!  Exiting!")
-            exit(1)
+            logger.critical("None of the listed pools exist!  Exiting!")
+            sys.exit(1)
 
         return self
 
@@ -166,7 +168,7 @@ class CephClusterConnection:
                 pass
             logger.info("Connection to the Ceph cluster closed.")
 
-    def null_cb(*args) -> None:
+    def null_cb(self, *extra_args) -> None:
         return None
 
     def async_stat_datapool_object(self, object_name: str = "", idx: Optional[int] = None) -> List:
@@ -188,8 +190,8 @@ class CephClusterConnection:
         for myidx in range(idxstart,idxend):
             try:
                 stat_ops.append(self.pool_ioctl[myidx].aio_stat(object_name,self.null_cb))
-            except Exception as e:
-                logger.error(f"[Exception] While attempting to stat {object_name}: {e}")
+            except rados.ObjectNotFound as e:
+                logger.error("[Exception] Object not found %s: %s", object_name, e)
 
         return stat_ops
 
@@ -209,24 +211,20 @@ class CephClusterConnection:
     def stat_syncpool_object(self, object_name: str = "") ->  bool:
         try:
             self.sync_ioctl.stat(object_name)
-            logger.debug(f"[STAT] Object exists: {object_name}")
+            logger.debug("[STAT] Object exists: %s", object_name)
             return True
         except rados.ObjectNotFound:
-            logger.debug(f"[STAT] Object does not exist: {object_name}")
+            logger.debug("[STAT] Object does not exist: %s", object_name)
             return False
 
     def remove_syncpool_object(self, object_name: str = "") -> None:
         try:
             self.sync_ioctl.remove_object(object_name)
-            logger.debug(f"Removed {object_name}")
+            logger.debug("Removed %s", object_name)
         except rados.ObjectNotFound:
-            logger.debug(f"Removal unnecesary, object {object_name} not present.")
-            pass
+            logger.debug("Removal unnecesary, object %s not present.", object_name)
 
     def write_syncpool_omap(self, object_name: str = "", key_name: str = "", contents: str = "") -> None:
-        if not self.stat_syncpool_object(object_name):
-            self.write_syncpool_object_data(object_name,"")
-
         with rados.WriteOpCtx() as write_op:
             self.sync_ioctl.set_omap(write_op,(key_name, ),( contents, ))
             self.sync_ioctl.operate_write_op(write_op, object_name)
@@ -247,12 +245,12 @@ class CephClusterConnection:
 
                 if not ret==0:
                     logger.critical("Failed to setup omap data read.")
-                    exit(1)
+                    sys.exit(1)
 
                 try:
                     self.sync_ioctl.operate_read_op(read_op, object_name)
                 except rados.ObjectNotFound:
-                    logger.error(f"Missing Object {object_name}")
+                    logger.error("Missing Object %s", object_name)
                     break
 
                 omap_batch = list(omap_iterator)
@@ -277,30 +275,32 @@ class CephClusterConnection:
     def read_syncpool_omap_vals_by_keys(self, object_name: str = "", key_list: Tuple = () ) -> Dict:
         results = {}
         with rados.ReadOpCtx() as read_op:
-            omap_iterator, ret = self.sync_ioctl.get_omap_vals_by_keys(read_op, key_list)
+            omap_iterator, _ret = self.sync_ioctl.get_omap_vals_by_keys(read_op, key_list)
             try:
                 self.sync_ioctl.operate_read_op(read_op,object_name)
             except rados.ObjectNotFound:
-                logger.debug(f"Object {object_name} not found.")
+                logger.debug("Object %s not found.", object_name)
             else:
                 results = {key: json.loads(val.decode("utf-8")) for key, val in dict(omap_iterator).items()}
 
         return results
 
-    def remove_syncpool_omap_keys(self, object_name: str = "", key_list: List = []) -> None:
+    def remove_syncpool_omap_keys(self, object_name: str = "", key_list: List = None) -> None:
+        if not isinstance(key_list,List):
+            return
+
         with rados.WriteOpCtx() as write_op:
             self.sync_ioctl.remove_omap_keys(write_op, tuple(key_list))
             try:
                 self.sync_ioctl.operate_write_op(write_op, object_name)
             except rados.ObjectNotFound:
-                logger.info(f"Primary results object not found: {object_name}")
-                pass
+                logger.info("Primary results object not found: %s", object_name)
 
 # End class CephClusterConnection
 
 class CephGapScanner:
-    def __init__(self, ceph: CephClusterConnection) -> None:
-        self.ceph = ceph
+    def __init__(self, localceph: CephClusterConnection) -> None:
+        self.ceph = localceph
         self.shard_count = 1
         self.results = {}
         self.bucket_gap_results_obj_count = 0
@@ -343,34 +343,32 @@ class CephGapScanner:
             pass
         else:
             self.shard_count = self.ceph.read_syncpool_object_data(self.SYNC_OBJECT_NAME)["shard_count"]
-            logger.info(f"Deleting primary sync object: {self.SYNC_OBJECT_NAME}")
+            logger.info("Deleting primary sync object: %s", self.SYNC_OBJECT_NAME)
             self.ceph.remove_syncpool_object(self.SYNC_OBJECT_NAME)
 
         for i in range(self.shard_count):
             if self.ceph.stat_syncpool_object(f"{self.SYNC_OBJECT_NAME}.{i}"):
-                logger.info(f"Deleting sync object: {self.SYNC_OBJECT_NAME}.{i}")
+                logger.info("Deleting sync object: %s.%i", self.SYNC_OBJECT_NAME, i)
                 self.ceph.remove_syncpool_object(f"{self.SYNC_OBJECT_NAME}.{i}")
 
         logger.critical("Finished deleting sync objects.")
 
-    def delete_gap_objects(self, bucket_list: list = []) -> None:
+    def delete_gap_objects(self, bucket_list: list = None) -> None:
         remove_all = False
-        if bucket_list:
-            logger.debug(f"Deleting gap results for bucket(s) {bucket_list}")
+        if not isinstance(bucket_list, List):
+            bucket_list = []
+
+        if len(bucket_list) > 0:
+            logger.debug("Deleting prior gap results for bucket(s) %s", bucket_list)
         else:
             logger.critical("Deleting gap restults object(s)...")
             bucket_list = list(self.read_gap_header(cache=True))
             remove_all = True
 
-        if self.ceph.stat_syncpool_object(self.RESULTS_OBJECT_NAME):
-            logger.info("Primary results object found.")
-        else:
-            logger.info("Primary results object not found.")
-
         running_hosts = self.get_other_running_hosts()
         if len(running_hosts) and remove_all:
             logger.critical("There are active running processes. Exiting!")
-            exit(1)
+            sys.exit(1)
 
         for bucket_name in bucket_list:
             idx = 0
@@ -378,27 +376,30 @@ class CephGapScanner:
                 idx += 1
                 results_object = f"{self.RESULTS_OBJECT_NAME}.{bucket_name}.{idx}"
                 if self.ceph.stat_syncpool_object(results_object):
-                    logger.info(f"Sync object found, deleting: {results_object}")
+                    logger.info("Sync object found, deleting: %s", results_object)
                     self.ceph.remove_syncpool_object(results_object)
                 else:
                     break
 
         if remove_all:
             if self.ceph.stat_syncpool_object(self.RESULTS_OBJECT_NAME):
-                logger.info(f"Deleting primary results object: {self.RESULTS_OBJECT_NAME}")
+                logger.info("Deleting primary results object: %s", self.RESULTS_OBJECT_NAME)
                 self.ceph.remove_syncpool_object(self.RESULTS_OBJECT_NAME)
         else:
-            logger.info(f"Deleting bucket keys from {self.RESULTS_OBJECT_NAME}")
+            logger.info("Deleting bucket keys from %s", self.RESULTS_OBJECT_NAME)
             self.ceph.remove_syncpool_omap_keys(self.RESULTS_OBJECT_NAME,bucket_list)
 
     def populate_sync_objects(self, shard_count: int = 1, bucket_count: int = 0) -> None:
         self.shard_count=shard_count
+        if not self.ceph.stat_syncpool_object(self.RESULTS_OBJECT_NAME):
+            self.ceph.write_syncpool_object_data(self.RESULTS_OBJECT_NAME,"")
+
         if self.ceph.stat_syncpool_object(self.SYNC_OBJECT_NAME):
-            logger.debug(f"Found primary sync object: {self.SYNC_OBJECT_NAME}")
+            logger.debug("Found primary sync object: %s", self.SYNC_OBJECT_NAME)
             self.touch_sync_state(bucket_name='', rados_obj_count=0)
             bucket_metadata_header = self.ceph.read_syncpool_object_data(self.SYNC_OBJECT_NAME)
             running_hosts = self.get_other_running_hosts()
-            logger.debug(f'Request {shard_count} shards, existing {bucket_metadata_header["shard_count"]}')
+            logger.debug("Request %i shards, existing %i", shard_count, bucket_metadata_header["shard_count"])
             if shard_count <= ( bucket_metadata_header["shard_count"] * 1.5 ) or running_hosts:
                 shard_count = self.shard_count = bucket_metadata_header["shard_count"]
             else:
@@ -407,18 +408,18 @@ class CephGapScanner:
                 self.populate_sync_objects(shard_count, bucket_count)
                 return
         else:
-            logger.info(f"Populating sync objects...")
-            logger.debug(f"Creating primary sync object: {self.SYNC_OBJECT_NAME}")
+            logger.info("Populating sync objects...")
+            logger.debug("Creating primary sync object: %s", self.SYNC_OBJECT_NAME)
             sync_data = { "bucket_count": bucket_count, "shard_count": shard_count, "epoch": round(time.time(),3) }
             self.ceph.write_syncpool_object_data(self.SYNC_OBJECT_NAME,json.dumps(sync_data).encode("utf-8"))
             self.touch_sync_state(bucket_name='', rados_obj_count=0)
 
         for i in range(shard_count):
             if self.ceph.stat_syncpool_object(f"{self.SYNC_OBJECT_NAME}.{i}"):
-                logger.debug(f"Found sync object: {self.SYNC_OBJECT_NAME}.{i}")
+                logger.debug("Found sync object: %s.%i", self.SYNC_OBJECT_NAME, i)
             else:
-                logger.debug(f"Creating sync object: {self.SYNC_OBJECT_NAME}.{i}")
-                self.ceph.write_syncpool_object_data(f"{self.SYNC_OBJECT_NAME}.{i}",b'')
+                logger.debug("Creating sync object: %s.%i", self.SYNC_OBJECT_NAME, i)
+                self.ceph.write_syncpool_object_data(f"{self.SYNC_OBJECT_NAME}.{i}",'')
 
         logger.info("Finished populating sync objects...")
 
@@ -427,12 +428,15 @@ class CephGapScanner:
             self.bucket_gap_results_obj_count += 1  # Increment first, so 0 means no objects in the bucket status omap.
             results_stored_size = len(json.dumps(self.results).encode("utf-8"))
             results_object = f"{self.RESULTS_OBJECT_NAME}.{bucket_name}.{self.bucket_gap_results_obj_count}"
-            logger.info(f"Writing result object {results_object} of {results_stored_size} bytes")
+            logger.info("Writing result object %s of %i bytes", results_object, results_stored_size)
+            if not self.ceph.stat_syncpool_object(results_object):
+                self.ceph.write_syncpool_object_data(results_object,"")
+
             try:
                 self.ceph.write_syncpool_object_data(results_object,json.dumps(self.results))
             except Exception as e:
-                logger.error(f"Failed to write results to {results_object}: {e}")
-                logger.critical(f"Dumping result here due to failure to write {results_object}: {json.dumps(self.results)}")
+                logger.error("Failed to write results to %s: %s", results_object, e)
+                logger.critical("Dumping result here due to failure to write %s: %s", results_object, json.dumps(self.results))
             else:
                 bucket_statistics = { "results_obj_count": self.bucket_gap_results_obj_count, "gap_count": self.bucket_gap_count, "latest_scan": round(time.time(),3) }
                 self.ceph.write_syncpool_omap(self.RESULTS_OBJECT_NAME, bucket_name, json.dumps(bucket_statistics))
@@ -445,7 +449,7 @@ class CephGapScanner:
 
     def add_result_entry(self, bucket_name: str = '', object_name: str = '', rados_object: str = '', final: bool = False) -> None:
         if not final:
-            logger.debug(f"Adding gap for s3://{bucket_name}/{object_name} :: {rados_object}")
+            logger.debug("Adding gap for s3://%s/%s :: %s", bucket_name, object_name, rados_object)
             if object_name not in self.results:
                 self.results[object_name]={ "epoch": round(time.time(), 3), "missing_rados_objects": [ ] }
             self.results[object_name]["missing_rados_objects"].append(rados_object)
@@ -455,7 +459,7 @@ class CephGapScanner:
             self.write_result_object(bucket_name, final)
 
     def touch_sync_state(self, bucket_name: str = '', rados_obj_count: int = 0, gap_count: int = 0) -> None:
-        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "rados_obj_count": rados_obj_count, 
+        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "rados_obj_count": rados_obj_count,
                         "gap_count": gap_count, "bucket_counter": self.processed_bucket_count,
                         "total_buckets": self.total_bucket_count, "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
         self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{MYHOST}.{MYPID}" , json.dumps(sync_state))
@@ -464,40 +468,40 @@ class CephGapScanner:
         self.ceph.remove_syncpool_omap_keys(self.SYNC_OBJECT_NAME, [ f"{self.MYHOST}.{self.MYPID}" ])
 
     def start_bucket(self, bucket_name, match: str = '') -> None:
-        self.delete_gap_objects(bucket_name)
+        self.delete_gap_objects([ bucket_name ])
         shardid = self.hash_bucket_name(bucket_name)
-        logger.debug(f"Setting bucket start metadata to sync shard {shardid}")
-        sync_metadata = { "hostname": MYHOST, "pid": MYPID, "rados_obj_count": 0, "gap_count": 0, 
+        logger.debug("Setting bucket start metadata to sync shard %i", shardid)
+        sync_metadata = { "hostname": MYHOST, "pid": MYPID, "rados_obj_count": 0, "gap_count": 0,
                          "start_time": round(time.time(),3), "end_time": 0, "match": match }
         self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(sync_metadata))
         self.touch_sync_state(bucket_name,0,0)
 
     def get_bucket_meta(self, bucket_name: str) -> Union[bool]:
         shardid = self.hash_bucket_name(bucket_name)
-        logger.info(f"Getting bucket metadata from shard {shardid}")
+        logger.info("Getting bucket metadata from shard %i", shardid)
         omap_data = self.ceph.read_syncpool_omap_vals_by_keys(f"{self.SYNC_OBJECT_NAME}.{shardid}", ( bucket_name, ))
         results = list(omap_data)
 
         if results:
             rval = results[0]
-            logger.debug(f"Found bucket metadata: {rval}")
+            logger.debug("Found bucket metadata: %s", rval)
             return omap_data[rval]
-        else:
-            logger.debug(f"Bucket metadata not present.")
-            return False
+
+        logger.debug("Bucket metadata not present.")
+        return False
 
     def end_bucket(self, bucket_name: str, rados_obj_count: int) -> None:
         shardid = self.hash_bucket_name(bucket_name)
-        logger.info(f"Setting bucket end metadata for {bucket_name} to sync shard {shardid}")
+        logger.info("Setting bucket end metadata for %s to sync shard %i", bucket_name, shardid)
         bucket_meta = self.get_bucket_meta(bucket_name)
         if bucket_meta:
             bucket_meta.update( { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, "rados_obj_count": rados_obj_count,
                                 "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) })
-            logger.debug(f"Bucket meta: {bucket_meta}")
+            logger.debug("Bucket meta: %s", bucket_meta)
             self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(bucket_meta))
             self.touch_sync_state(bucket_name, rados_obj_count, self.bucket_gap_count)
         else:
-            logger.error(f"Bucket start metadata for {bucket_name} is missing from shard {shardid}")
+            logger.error("Bucket start metadata for %s is missing from shard %i", bucket_name, shardid)
 
         self.bucket_gap_count = 0
 
@@ -506,8 +510,8 @@ class CephGapScanner:
         running_hosts = self.get_other_running_hosts(bucket_keyed=True)
         if bucket_name in running_hosts:
             return running_hosts[bucket_name]
-        else:
-            return False
+
+        return False
 
     def get_other_running_hosts(self, bucket_keyed: bool = False) -> Dict:
         running_hosts = {}
@@ -562,7 +566,14 @@ class CephGapScanner:
 
         return bucket_gap_results
 
-    def generate_gap_list(self, verify: bool = False, bucket_list: List = [], exclude_bucket_list: List = []) -> None:
+    def generate_gap_list(self, verify: bool = False, bucket_list: List = None, exclude_bucket_list: List = None) -> None:
+
+        if not isinstance(exclude_bucket_list, List):
+            exclude_bucket_list = []
+
+        if not isinstance(bucket_list,List):
+            bucket_list = []
+
         logger.info("Generating gap list report")
         gap_results = {}
         found_count = 0
@@ -570,15 +581,15 @@ class CephGapScanner:
 
         for obj in [self.SYNC_OBJECT_NAME, self.RESULTS_OBJECT_NAME]:
             if not self.ceph.stat_syncpool_object(obj):
-                logger.critical(f"Sync / Results object found - {obj}.  Exiting")
-                exit(1)
-            logger.debug(f"Found primary sync / results object: {obj}")
+                logger.critical("Sync / Results object found: %s.  Exiting", obj)
+                sys.exit(1)
+            logger.debug("Found primary sync / results object: %s", obj)
 
         running_hosts = self.get_other_running_hosts()
 
-        if len(bucket_list) == 0:
+        if not bucket_list:
             bucket_list = list(self.read_gap_header(cache = True))
- 
+
         for bucket_name in bucket_list:
             if bucket_name in exclude_bucket_list:
                 self.skipped_bucket_count += 1
@@ -588,7 +599,7 @@ class CephGapScanner:
                 for object_name in list(gap_results[bucket_name].keys()):
                     object_results = gap_results[bucket_name][object_name]
                     for rados_object in object_results["missing_rados_objects"]:
-                        logger.debug(f"Verifying {rados_object}")
+                        logger.debug("Verifying %s", rados_object)
                         self.in_flight.append({"stat_op": self.ceph.async_stat_datapool_object(rados_object), "bucket_name": bucket_name, "rados_object": rados_object, "object_name": object_name })
 
                     while len(self.in_flight) >= self.max_inflight:
@@ -599,7 +610,7 @@ class CephGapScanner:
                             results.append(stat_op.get_return_value())
 
                         if results.count(0) == len(oldest_op['stat_op']):
-                            logger.debug(f"Found {oldest_op['rados_object']}")
+                            logger.debug("Found %s", oldest_op['rados_object'])
                             found_count += 1
                             gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects'].remove(oldest_op['rados_object'])
                             if len(gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects']) == 0:
@@ -615,7 +626,7 @@ class CephGapScanner:
                         results.append(stat_op.get_return_value())
 
                     if results.count(0) == len(oldest_op['stat_op']):
-                        logger.debug(f"Found {oldest_op['rados_object']}")
+                        logger.debug("Found %s", oldest_op['rados_object'])
                         found_count += 1
                         gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects'].remove(oldest_op['rados_object'])
                         if len(gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects']) == 0:
@@ -624,7 +635,7 @@ class CephGapScanner:
                             del gap_results[oldest_op['bucket_name']]
 
         if self.json:
-            dump_object = {"active_processes": True if len(running_hosts) else False, "verified": verify }
+            dump_object = {"active_processes": bool(len(running_hosts) > 0), "verified": verify }
             if verify:
                 dump_object['found_count'] = found_count
             print(json.dumps(dump_object | { "gap_results": gap_results }))
@@ -650,9 +661,9 @@ class CephGapScanner:
         logger.info("Generating bucket metadata report")
         if not self.ceph.stat_syncpool_object(self.SYNC_OBJECT_NAME):
             logger.critical("No primary sync object found.  Exiting")
-            exit(1)
+            sys.exit(1)
 
-        logger.debug(f"Found primary sync object: {self.SYNC_OBJECT_NAME}")
+        logger.debug("Found primary sync object: %s", self.SYNC_OBJECT_NAME)
 
         bucket_metadata_header = self.ceph.read_syncpool_object_data(self.SYNC_OBJECT_NAME)
         self.shard_count = bucket_metadata_header["shard_count"]
@@ -717,7 +728,7 @@ class CephGapScanner:
     def check_aio_result(self, op_obj: Dict) -> Union[Dict, int, None]:
         """
         Check return of Async Object Stat.
-        - If not found, but pool index is 0 ( only checked first pool ), 
+        - If not found, but pool index is 0 ( only checked first pool ),
         re-submit to all remaining pools
         - If not found, and pool index is 1 ( all pools checked ),
         return 1
@@ -730,28 +741,29 @@ class CephGapScanner:
 
         if results.count(0) != len(op_obj['stat_op']):
             if op_obj['poolidx'] == 0:
-                logger.info(f"{op_obj['rados_object']} not found in default pool, checking remaining pools.")
+                logger.info("%s not found in default pool, checking remaining pools.", op_obj['rados_object'])
                 op_obj.update({'stat_op': self.ceph.async_stat_datapool_object(op_obj['rados_object'],1), 'poolidx': 1 })
                 return op_obj
-            else:
-                self.add_result_entry(bucket_name=op_obj['bucket'], object_name=op_obj['user_object'], rados_object=op_obj['rados_object'])
-                logger.debug(f"[NOT FOUND] s3://{op_obj['bucket']}/{op_obj['user_object']} MISSING {op_obj['rados_object']}")
-                return 1
+
+            self.add_result_entry(bucket_name=op_obj['bucket'], object_name=op_obj['user_object'], rados_object=op_obj['rados_object'])
+            logger.debug("[NOT FOUND] s3://%s/%s MISSING %s", op_obj['bucket'], op_obj['user_object'], op_obj['rados_object'])
+            return 1
 
         return None
 
     def output_status(self, bucket_name: str = '', rados_obj_count: int = 0, delta_start: int = 0, delta_last: int = 0):
-        logger.info(f"[Status] Submitted {rados_obj_count} rados objects in {delta_start:.3f} seconds ( last 10k in {delta_last:.3f} seconds ) for {bucket_name}.")
+        logger.info("[Status] Submitted %s rados objects in %.3f seconds ( last 10k in %.3f seconds ) for %s.",
+                    rados_obj_count, delta_start, delta_last, bucket_name)
         self.touch_sync_state(bucket_name=bucket_name, rados_obj_count=rados_obj_count, gap_count=self.bucket_gap_count)
 
     def process_bucket(self, bucket_name: str, force_scan = False) -> None:
         bucket_meta = None
 
         if not force_scan:
-            logger.info(f"Checking {bucket_name} via sync state")
+            logger.info("Checking %s via sync state", bucket_name)
             is_scanning = self.is_bucket_scanning(bucket_name)
             if is_scanning:
-                logger.info(f"Bucket {bucket_name} is actively being scanned on {is_scanning['hostname']} ({is_scanning['pid']})")
+                logger.info("Bucket %s is actively being scanned on %s (%i)", bucket_name, is_scanning['hostname'], is_scanning['pid'])
                 return None
 
         bucket_meta = self.get_bucket_meta(bucket_name)
@@ -764,14 +776,15 @@ class CephGapScanner:
             if force_scan:
                 logger.info("Force scan set, scanning.")
             elif time.time() - bucket_meta["end_time"] > int(self.max_age):
-                logger.info(f"Bucket {bucket_name} end time ( {dt} ) is more than {hum} old.  Processing again.")
+                logger.info("Bucket %s end time ( %s ) is more than %s old.  Processing again.", bucket_name, dt, hum)
             elif not self.match.startswith(scanned_match):
-                logger.info(f"Bucket {bucket_name} last scan ( {dt} ) only covered prefix '{scanned_match}', not '{self.match}'.  Processing again.")
+                logger.info("Bucket %s last scan ( %s ) only covered prefix '%s', not '%s'.  Processing again.",
+                            bucket_name, dt, scanned_match, self.match)
             else:
-                logger.info(f"Bucket {bucket_name} end time ( {dt} ) is less than {hum} old.  Skipping.")
+                logger.info("Bucket %s end time ( %s ) is less than %s old.  Skipping.", bucket_name, dt, hum)
                 return None
 
-        logger.info(f"Processing {bucket_name}")
+        logger.info("Processing %s", bucket_name)
         self.processed_bucket_count += 1
 
         bucket_rados_obj_count = 0
@@ -798,12 +811,12 @@ class CephGapScanner:
                 while len(self.in_flight) >= self.max_inflight:
                     processed_count += 1
                     res = self.check_aio_result(self.in_flight.popleft())
-                    if type(res) is dict:
+                    if isinstance(res, dict):
                         self.in_flight.append(res)
 
         while len(self.in_flight):
             res = self.check_aio_result(self.in_flight.popleft())
-            if type(res) is dict:
+            if isinstance(res, dict):
                 self.in_flight.append(res)
 
         self.write_result_object(bucket_name, final = True)
@@ -812,10 +825,17 @@ class CephGapScanner:
         self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
 
         self.end_bucket(bucket_name,bucket_rados_obj_count)
+        return None
 
-    def process_list(self, bucket_list: List = [], exclude_bucket_list: List = []) -> None:
-        if len(bucket_list):
-            logger.info(f"Starting processing of {len(bucket_list)} bucket(s)")
+    def process_list(self, bucket_list: List = None, exclude_bucket_list: List = None) -> None:
+        if not isinstance(exclude_bucket_list, List):
+            exclude_bucket_list = []
+
+        if not isinstance(bucket_list, List):
+            bucket_list = []
+
+        if len(bucket_list) > 0:
+            logger.info("Starting processing of %i bucket(s)", len(bucket_list))
             self.populate_sync_objects(1, len(bucket_list))
 
             for bucket in bucket_list:
@@ -823,7 +843,7 @@ class CephGapScanner:
                     self.process_bucket(bucket)
                 else:
                     self.skipped_bucket_count += 1
-                    logger.debug(f"Found {bucket} in exclude_bucket_list, skipping.")
+                    logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
             return None
 
         # If we get here, we're processing -all- buckets
@@ -838,7 +858,7 @@ class CephGapScanner:
             bc_out, _ = bc.communicate()
             self.total_bucket_count = int(bc_out.decode("utf-8").strip())
 
-        logger.info(f"Starting processing of {self.total_bucket_count} bucket(s)")
+        logger.info("Starting processing of %i bucket(s)", self.total_bucket_count)
 
         self.shard_count = int(self.total_bucket_count/400) + 1
         self.populate_sync_objects(self.shard_count, self.total_bucket_count)
@@ -848,11 +868,11 @@ class CephGapScanner:
                 for bl_line in io.TextIOWrapper(bl.stdout, encoding="utf-8"):
                     bl_line = bl_line.strip()
                     if re.match(r'^"',bl_line):
-                        """
-                        The raw output of bucket list is a json array.  We need to only process lines that start with
-                        double quotes, and then we need to remove the double quotes and ending comma (if present), but
-                        NOT remove any other characters in between.
-                        """
+                        # The raw output of bucket list is a json array.  We need to only process
+                        # lines that start with double quotes, and then we need to remove the
+                        # double quotes and ending comma (if present), but NOT remove any other
+                        # characters in between.
+
                         bucket = re.sub(r'^"','',bl_line)
                         bucket = re.sub(r',$','',bucket)
                         bucket = re.sub(r'"$','',bucket)
@@ -861,7 +881,7 @@ class CephGapScanner:
                             self.process_bucket(bucket)
                         else:
                             self.skipped_bucket_count += 1
-                            logger.debug(f"Found {bucket} in exclude_bucket_list, skipping.")
+                            logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
 
         else: # Randomize the bucket list, this is the default.
             with subprocess.Popen(self.BUCKET_LIST_COMMAND, bufsize=1048576, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as bl, \
@@ -877,7 +897,7 @@ class CephGapScanner:
                         self.process_bucket(bucket)
                     else:
                         self.skipped_bucket_count += 1
-                        logger.debug(f"Found {bucket} in exclude_bucket_list, skipping.")
+                        logger.debug("Found %s in exclude_bucket_list, skipping.", bucket)
 
         return None
 
@@ -896,7 +916,7 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--listfile", default = '', help="Optional: Bucket list file, should be one bucket name per line.")
     parser.add_argument("-m", "--match", default = '', help="Specify a prefix match for the object names.  Only objects matching this prefix will be checked for gaps.")
     parser.add_argument("-n", "--norandom", default = False, action="store_true", help="By default, the script randomizes the list of buckets before processing.  On large bucket count environments, this may cause significant delay before start of processing due to the way the randomizing occurs.  Set '-n' to Not Randomize the list to remove this delay.")
-    parser.add_argument("--namespace", default = f'rgw-gap-list', help="What namespace to use for sync / results objects. Default: rgw-gap-list")
+    parser.add_argument("--namespace", default = 'rgw-gap-list', help="What namespace to use for sync / results objects. Default: rgw-gap-list")
     parser.add_argument("-p", "--pool", default = 'default.rgw.buckets.data default.rgw.buckets.non-ec', help="Bucket Data Pool(s), default 'default.rgw.buckets.data default.rgw.buckets.non-ec', quoted space separated list is supported.")
     parser.add_argument("-s", "--syncpool", default = 'default.rgw.buckets.index', help="Synchronization / Queuing pool for the script ot use, default 'default.rgw.buckets.index'.")
     parser.add_argument("-r", "--report",  default = False, action="store_true", help="Generate bucket scrub metadata report.")
@@ -924,25 +944,25 @@ if __name__ == "__main__":
         exclude_bucket_list = [ bn for bn in args.excludelist.split(" ") if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",bn) ]
         if len(exclude_bucket_list) == 0:
             logger.critical("The provided exclude bucket list did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
-            exit(1)
+            sys.exit(1)
     elif args.excludefile:
-        with open(args.excludefile) as elist:
+        with open(args.excludefile, encoding="utf-8") as elist:
             exclude_bucket_list = [ line.strip() for line in elist if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",line.strip()) ]
         if len(exclude_bucket_list) == 0:
             logger.critical("The provided exclude bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
-            exit(1)
+            sys.exit(1)
 
     if args.bucketlist:
         bucket_list = [ bn for bn in args.bucketlist.split(" ") if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",bn) ]
         if len(bucket_list) == 0:
             logger.critical("The provided bucket list did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
-            exit(1)
+            sys.exit(1)
     elif args.listfile:
-        with open(args.listfile) as blist:
+        with open(args.listfile, encoding="utf-8") as blist:
             bucket_list = [ line.strip() for line in blist if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",line.strip()) ]
         if len(bucket_list) == 0:
             logger.critical("The provided bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
-            exit(1)
+            sys.exit(1)
 
     with CephClusterConnection(ceph_conf=args.conf, pool_names=args.pool.split(" "), sync_pool=args.syncpool) as ceph:
         ceph.namespace = args.namespace.strip()
