@@ -729,8 +729,7 @@ class CephGapScanner:
         """
         update_data = { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, 
                         "bucket_object_count": self.bucket_object_count, "rados_obj_count": rados_obj_count,
-                        "bucket_objects_processed": self.bucket_objects_processed,
-                        "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) }
+                        "bucket_objects_processed": self.bucket_objects_processed }
         self.update_bucket(bucket_name, update_data)
         self.touch_sync_state(bucket_name, rados_obj_count)
         self.bucket_gap_count = 0
@@ -1125,7 +1124,7 @@ class CephGapScanner:
         self.processed_bucket_count += 1
 
         bucket_rados_obj_count = 0
-        starttime = laststatus = round(time.time(),3)
+        start_time = last_status_time = round(time.time(),3)
         self.start_bucket(bucket_name,self.match)
 
         bucket_stats = {}
@@ -1138,14 +1137,14 @@ class CephGapScanner:
         try:
             if bucket_stats['usage']['rgw.main']['num_objects'] == 0:
                 logger.debug("Bucket %s has zero objects.  Skipping.", bucket_name)
-                nowtime = round(time.time(),3)
-                self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+                now_time = round(time.time(),3)
+                self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time)
                 self.end_bucket(bucket_name,bucket_rados_obj_count)
                 return None
         except KeyError:
             logger.debug("Bucket %s has zero objects. Skipping.", bucket_name)
-            nowtime = round(time.time(),3)
-            self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+            now_time = round(time.time(),3)
+            self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time)
             self.end_bucket(bucket_name,bucket_rados_obj_count)
             return None
 
@@ -1188,9 +1187,9 @@ class CephGapScanner:
 
                 bucket_rados_obj_count += 1
                 if bucket_rados_obj_count % self.report_every_x_object_count == 0:
-                    nowtime = round(time.time(),3)
-                    self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus, op_queue.qsize())
-                    laststatus = nowtime
+                    now_time = round(time.time(),3)
+                    self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time, op_queue.qsize())
+                    last_status_time = now_time
 
                 # Add initial op to the queue. put() will naturally block if maxsize is reached
                 op_obj = {
@@ -1208,9 +1207,10 @@ class CephGapScanner:
 
         self.write_result_object(bucket_name, final = True)
 
-        nowtime = round(time.time(),3)
-        self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+        now_time = round(time.time(),3)
+        self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time)
 
+        self.update_bucket(bucket_name, { "total_time_secs": round(now_time - start_time,3)})
         self.end_bucket(bucket_name,bucket_rados_obj_count)
         return None
 
