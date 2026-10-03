@@ -6,7 +6,7 @@ Last Revision: 2026-10-02
 Version: 5.0
 
 ## Major version change log
-v5: Now multi-threaded ( submit / process )
+v5: Now multi-threaded ( separate submit / process threads )
 v4: Now storing results in RADOS
 v3: Now using async io
 v2: Now in Python, performing RADOS stat on the backing objects
@@ -74,17 +74,18 @@ Enjoy!
 """
 
 import argparse
-from collections import deque
 from datetime import datetime
 import hashlib
 import io
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import FrameType
 from typing import List, Dict, Optional, Tuple, Union
@@ -414,30 +415,32 @@ class CephGapScanner:
     bucket index exist in RADOS.
     """
     def __init__(self, localceph: CephClusterConnection) -> None:
-        self.ceph = localceph
-        self.shard_count = 1
-        self.results = {}
-        self.bucket_gap_results_obj_count = 0
         self.bucket_gap_count = 0
+        self.bucket_gap_results_obj_count = 0
+        self.bucket_object_count = 0
+        self.ceph = localceph
         self.gap_header_data = None
-        self.total_bucket_count = 0
-        self.processed_bucket_count = 0
-        self.report_every_x_object_count = 10000
-        self.namespace = "rgw-gap-list"
-        self.max_inflight = 15000
+        self.json = False
         self.match = ""
         self.max_age = 7 * 86400
-        self.json = False
+        self.max_inflight = 15000
+        self.namespace = "rgw-gap-list"
+        self.processed_bucket_count = 0
+        self.report_every_x_object_count = 10000
+        self.results = {}
+        self.shard_count = 1
         self.skipped_bucket_count = 0
-        self.in_flight = deque()
+        self.total_bucket_count = 0 
+
         self.MYPID = os.getpid()
         self.MYHOST = os.uname().nodename
 
         self.FIELD_SEPARATOR = "\xfe"
         self.BUCKET_LIST_COMMAND = ["radosgw-admin", "bucket", "list"]
         self.BUCKET_RADOSLIST_COMMAND = ['radosgw-admin', 'bucket', 'radoslist', f'--rgw-obj-fs={self.FIELD_SEPARATOR}']
-        self.SYNC_OBJECT_NAME = "sync"
+        self.BUCKET_STATS_COMMAND = ['radosgw-admin', 'bucket', 'stats']
         self.RESULTS_OBJECT_NAME = "results"
+        self.SYNC_OBJECT_NAME = "sync"
 
     def __enter__(self):
         """
@@ -515,17 +518,19 @@ class CephGapScanner:
 
         logger.info("Finished populating sync objects...")
 
-    def touch_sync_state(self, bucket_name: str = '', rados_obj_count: int = 0) -> None:
+    def touch_sync_state(self, bucket_name: str = '', rados_obj_count: int = 0, qsize: int = 0) -> None:
         """
         Update the synchronization state for this process.
 
         Args:
             bucket_name (str): Name of the current bucket being processed
             rados_obj_count (int): Count of RADOS objects processed
+            qsize (int): The number of RADOS stat calls in queue
         """
-        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "rados_obj_count": rados_obj_count,
-                        "gap_count": self.bucket_gap_count, "bucket_counter": self.processed_bucket_count,
-                        "total_buckets": self.total_bucket_count, "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
+        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "bucket_object_count": self.bucket_object_count, 
+                        "rados_obj_count": rados_obj_count, "gap_count": self.bucket_gap_count, 
+                        "bucket_counter": self.processed_bucket_count, "queue_size": qsize, "total_buckets": self.total_bucket_count, 
+                        "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
         self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{self.MYHOST}.{self.MYPID}" , json.dumps(sync_state))
 
     def rm_sync_state(self) -> None:
@@ -540,6 +545,11 @@ class CephGapScanner:
 
         This method removes both primary and shard-level sync objects.
         """
+        running_hosts = self.get_other_running_hosts()
+        if len(running_hosts) > 0:
+            logger.critical("There are active running processes. Exiting!")
+            sys.exit(1)
+
         logger.critical("Deleting sync objects...")
         try:
             ceph.sync_ioctl.stat(self.SYNC_OBJECT_NAME)
@@ -568,18 +578,18 @@ class CephGapScanner:
         remove_all = False
         if not isinstance(bucket_list, List):
             bucket_list = []
-
-        if len(bucket_list) > 0:
-            logger.debug("Deleting prior gap results for bucket(s) %s", bucket_list)
-        else:
-            logger.critical("Deleting gap results object(s)...")
-            bucket_list = list(self.read_gap_header(cache=True))
             remove_all = True
 
         running_hosts = self.get_other_running_hosts()
         if len(running_hosts) and remove_all:
             logger.critical("There are active running processes. Exiting!")
             sys.exit(1)
+
+        if len(bucket_list) > 0:
+            logger.debug("Deleting prior gap results for bucket(s) %s", bucket_list)
+        else:
+            logger.critical("Deleting gap results object(s)...")
+            bucket_list = list(self.read_gap_header(cache=True))
 
         for bucket_name in bucket_list:
             idx = 0
@@ -660,8 +670,9 @@ class CephGapScanner:
         self.delete_gap_objects([ bucket_name ])
         shardid = self.hash_bucket_name(bucket_name)
         logger.debug("Setting bucket start metadata to sync shard %i", shardid)
-        sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "rados_obj_count": 0, "gap_count": 0,
-                         "start_time": round(time.time(),3), "end_time": 0, "match": match }
+        sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "bucket_object_count": self.bucket_object_count, 
+                         "rados_obj_count": 0, "gap_count": 0, "start_time": round(time.time(),3), 
+                         "end_time": 0, "match": match }
         self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(sync_metadata))
         self.touch_sync_state(bucket_name,0)
 
@@ -700,8 +711,9 @@ class CephGapScanner:
         logger.info("Setting bucket end metadata for %s to sync shard %i", bucket_name, shardid)
         bucket_meta = self.get_bucket_meta(bucket_name)
         if bucket_meta:
-            bucket_meta.update( { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, "rados_obj_count": rados_obj_count,
-                                "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) })
+            bucket_meta.update( { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, 
+                                 "rados_obj_count": rados_obj_count, 
+                                 "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) })
             logger.debug("Bucket meta: %s", bucket_meta)
             self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(bucket_meta))
             self.touch_sync_state(bucket_name, rados_obj_count)
@@ -844,49 +856,69 @@ class CephGapScanner:
         if not bucket_list:
             bucket_list = list(self.read_gap_header(cache = True))
 
+        if verify:
+            op_queue = queue.Queue(maxsize=self.max_inflight)
+            results_lock = threading.Lock()
+
+            def verify_processor():
+                nonlocal found_count
+                while True:
+                    op_obj = op_queue.get()
+                    if op_obj is None:
+                        op_queue.task_done()
+                        break
+
+                    results = []
+                    for stat_op in op_obj['stat_op']:
+                        stat_op.wait_for_complete()
+                        results.append(stat_op.get_return_value())
+
+                    # If all specified pools returned 0, the object was found
+                    if len(results) > 0 and results.count(0) > 0:
+                        logger.debug("Found %s", op_obj['rados_object'])
+
+                        # Thread-safe deletion of resolved gaps
+                        with results_lock:
+                            found_count += 1
+                            bucket = op_obj['bucket_name']
+                            obj_name = op_obj['object_name']
+                            rados_obj = op_obj['rados_object']
+
+                            if bucket in gap_results and obj_name in gap_results[bucket]:
+                                if rados_obj in gap_results[bucket][obj_name]['missing_rados_objects']:
+                                    gap_results[bucket][obj_name]['missing_rados_objects'].remove(rados_obj)
+                                if len(gap_results[bucket][obj_name]['missing_rados_objects']) == 0:
+                                    del gap_results[bucket][obj_name]
+                                if len(gap_results[bucket]) == 0:
+                                    del gap_results[bucket]
+
+                    op_queue.task_done()
+
+            processor_thread = threading.Thread(target=verify_processor, daemon=True)
+            processor_thread.start()
+
         for bucket_name in bucket_list:
             if bucket_name in exclude_bucket_list:
                 self.skipped_bucket_count += 1
                 continue
-            gap_results[bucket_name] = self.read_gap_results(bucket_name,cache = True)
+
+            gap_results[bucket_name] = self.read_gap_results(bucket_name, cache=True)
+
             if verify:
-                for object_name in list(gap_results[bucket_name].keys()):
-                    object_results = gap_results[bucket_name][object_name]
-                    for rados_object in object_results["missing_rados_objects"]:
+                # Wrap dictionaries/lists in list() to freeze iterables against asynchronous background changes
+                for object_name, object_data in list(gap_results[bucket_name].items()):
+                    for rados_object in list(object_data["missing_rados_objects"]):
                         logger.debug("Verifying %s", rados_object)
-                        self.in_flight.append({"stat_op": self.ceph.async_stat_datapool_object(rados_object), "bucket_name": bucket_name, "rados_object": rados_object, "object_name": object_name })
+                        op_queue.put({
+                            "stat_op": self.ceph.async_stat_datapool_object(rados_object),
+                            "bucket_name": bucket_name,
+                            "rados_object": rados_object,
+                            "object_name": object_name
+                        })
 
-                    while len(self.in_flight) >= self.max_inflight:
-                        oldest_op = self.in_flight.popleft()
-                        results = []
-                        for stat_op in oldest_op['stat_op']:
-                            stat_op.wait_for_complete()
-                            results.append(stat_op.get_return_value())
-
-                        if results.count(0) == len(oldest_op['stat_op']):
-                            logger.debug("Found %s", oldest_op['rados_object'])
-                            found_count += 1
-                            gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects'].remove(oldest_op['rados_object'])
-                            if len(gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects']) == 0:
-                                del gap_results[oldest_op['bucket_name']][oldest_op['object_name']]
-                            if len(gap_results[oldest_op['bucket_name']]) == 0:
-                                del gap_results[oldest_op['bucket_name']]
-
-                while len(self.in_flight):
-                    oldest_op = self.in_flight.popleft()
-                    results = []
-                    for stat_op in oldest_op['stat_op']:
-                        stat_op.wait_for_complete()
-                        results.append(stat_op.get_return_value())
-
-                    if results.count(0) == len(oldest_op['stat_op']):
-                        logger.debug("Found %s", oldest_op['rados_object'])
-                        found_count += 1
-                        gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects'].remove(oldest_op['rados_object'])
-                        if len(gap_results[oldest_op['bucket_name']][oldest_op['object_name']]['missing_rados_objects']) == 0:
-                            del gap_results[oldest_op['bucket_name']][oldest_op['object_name']]
-                        if len(gap_results[oldest_op['bucket_name']]) == 0:
-                            del gap_results[oldest_op['bucket_name']]
+        if verify:
+            op_queue.put(None)
+            processor_thread.join()
 
         if self.json:
             dump_object = {"active_processes": bool(len(running_hosts) > 0), "verified": verify }
@@ -896,8 +928,8 @@ class CephGapScanner:
         else:
             missing_text = "STILL MISSING" if verify else "MISSING"
 
-            for bucket_name,bucket_data in gap_results.items():
-                for object_name,object_data in bucket_data.items():
+            for bucket_name, bucket_data in gap_results.items():
+                for object_name, object_data in bucket_data.items():
                     for rados_object in object_data['missing_rados_objects']:
                         print(f"s3://{bucket_name}/{object_name} {missing_text} {rados_object}")
                         missing_count += 1
@@ -939,7 +971,7 @@ class CephGapScanner:
                     print(f"  {host} ( {len(data.items())} processes )")
                     for pid,status in data.items():
                         dt = datetime.fromtimestamp(status['epoch']).strftime('%Y-%m-%d %H:%M:%S')
-                        print(f"    PID: {pid}, Bucket: {status['current_bucket']}, Rados Count: {status['rados_obj_count']}, Gap Count: {status['gap_count']}, Bucket Counter: {status['bucket_counter']}, Last Updated: {dt}")
+                        print(f"    PID: {pid}, Bucket: {status['current_bucket']}, Object Count: {status.get('bucket_object_count',0)}, Rados Count: {status['rados_obj_count']}, QD: {status['queue_size']}, Gap Count: {status['gap_count']}, Bucket Counter: {status['bucket_counter']}, Last Updated: {dt}")
                         host_processed += status['bucket_counter']
                         total_processed += status['bucket_counter']
                     print(f"  Host processed: {host_processed}")
@@ -950,7 +982,7 @@ class CephGapScanner:
             if len(bucket_state):
                 print("\nBucket State:")
                 for bucket_name,data in bucket_state.items():
-                    print(f"  {bucket_name}:: Rados Count: {data['rados_obj_count']}, ", end="")
+                    print(f"  {bucket_name}:: Object Count: {data.get('bucket_object_count',0)}, Rados Count: {data['rados_obj_count']}, ", end="")
                     if data['end_time']:
                         dt = datetime.fromtimestamp(data['end_time']).strftime('%Y-%m-%d %H:%M:%S')
                         hum = self.seconds_to_human(data['total_time_secs'])
@@ -995,23 +1027,23 @@ class CephGapScanner:
         """
         Check return of Async Object Stat.
 
+        - If found, return None
         - If not found, but pool index is 0 (only checked first pool),
           re-submit to all remaining pools
         - If not found, and results entry, return None
-        - If found, return None
 
         Args:
             op_obj (Dict): Operation object containing stat operation data
 
         Returns:
-            Union[Dict, int, None]: Updated operation object, result code, or None
+            Union[Dict, None]: Updated operation object, or None
         """
         results = []
         for stat_op in op_obj['stat_op']:
             stat_op.wait_for_complete()
             results.append(stat_op.get_return_value())
 
-        if results.count(0) != len(op_obj['stat_op']):
+        if len(results) > 0 and results.count(0) == 0:
             if op_obj['poolidx'] == 0:
                 logger.info("%s not found in default pool, checking remaining pools.", op_obj['rados_object'])
                 op_obj.update({'stat_op': self.ceph.async_stat_datapool_object(op_obj['rados_object'],1), 'poolidx': 1 })
@@ -1022,7 +1054,7 @@ class CephGapScanner:
 
         return None
 
-    def output_status(self, bucket_name: str = '', rados_obj_count: int = 0, delta_start: int = 0, delta_last: int = 0):
+    def output_status(self, bucket_name: str = '', rados_obj_count: int = 0, delta_start: int = 0, delta_last: int = 0, qsize: int = 0):
         """
         Output processing status information.
 
@@ -1032,9 +1064,9 @@ class CephGapScanner:
             delta_start (int): Time elapsed since start
             delta_last (int): Time elapsed since last status update
         """
-        logger.info("[Status] Submitted %s rados objects in %.3f seconds ( last 10k in %.3f seconds ) for %s.",
-                    rados_obj_count, delta_start, delta_last, bucket_name)
-        self.touch_sync_state(bucket_name, rados_obj_count)
+        logger.info("[Status] Submitted %s rados objects in %.3f seconds ( last 10k in %.3f seconds ) for %s. Queue size: %i",
+                    rados_obj_count, delta_start, delta_last, bucket_name, qsize)
+        self.touch_sync_state(bucket_name, rados_obj_count, qsize)
 
     def process_bucket(self, bucket_name: str, force_scan = False) -> None:
         """
@@ -1045,6 +1077,7 @@ class CephGapScanner:
             force_scan (bool): Whether to force scanning even if recently scanned
         """
         bucket_meta = None
+        self.bucket_object_count=0
 
         if not force_scan:
             logger.info("Checking %s via sync state", bucket_name)
@@ -1078,6 +1111,52 @@ class CephGapScanner:
         starttime = laststatus = round(time.time(),3)
         self.start_bucket(bucket_name,self.match)
 
+        bucket_stats = {}
+        with subprocess.Popen(self.BUCKET_STATS_COMMAND + [f"--bucket={bucket_name}"], bufsize=1048576,
+                              shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as bsl:
+            bsl_data, _ = bsl.communicate()
+            if bsl.returncode == 0 and bsl_data:
+                bucket_stats = json.loads(bsl_data.decode("utf-8"))
+
+        try:
+            if bucket_stats['usage']['rgw.main']['num_objects'] == 0:
+                logger.debug("Bucket %s has zero objects.  Skipping.", bucket_name)
+                nowtime = round(time.time(),3)
+                self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+                self.end_bucket(bucket_name,bucket_rados_obj_count)
+                return None
+        except KeyError:
+            logger.debug("Bucket %s has zero objects. Skipping.", bucket_name)
+            nowtime = round(time.time(),3)
+            self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+            self.end_bucket(bucket_name,bucket_rados_obj_count)
+            return None
+
+        self.bucket_object_count=bucket_stats['usage']['rgw.main']['num_objects']
+        self.touch_sync_state(bucket_name, 0, 0)
+
+        # Initialize thread-safe queue to manage in-flight operations natively
+        op_queue = queue.Queue(maxsize=self.max_inflight)
+
+        def result_processor():
+            while True:
+                op_obj = op_queue.get()
+                if op_obj is None:  # Sentinel value to exit
+                    op_queue.task_done()
+                    break
+
+                res = self.check_aio_result(op_obj)
+
+                if isinstance(res, dict):
+                    # Operation required further checks on remaining pools, put it back
+                    op_queue.put(res)
+
+                op_queue.task_done()
+
+        # Start consumer thread
+        processor_thread = threading.Thread(target=result_processor, daemon=True)
+        processor_thread.start()
+
         with subprocess.Popen(self.BUCKET_RADOSLIST_COMMAND + [f"--bucket={bucket_name}"], bufsize=1048576, shell=False, \
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as brl:
             for brl_line in io.TextIOWrapper(brl.stdout, encoding="utf-8"):
@@ -1088,21 +1167,22 @@ class CephGapScanner:
                 bucket_rados_obj_count += 1
                 if bucket_rados_obj_count % self.report_every_x_object_count == 0:
                     nowtime = round(time.time(),3)
-                    self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus)
+                    self.output_status(bucket_name, bucket_rados_obj_count, nowtime - starttime, nowtime - laststatus, op_queue.qsize())
                     laststatus = nowtime
 
+                # Add initial op to the queue. put() will naturally block if maxsize is reached
+                op_obj = {
+                    "stat_op": self.ceph.async_stat_datapool_object(object_data[0], 0),
+                    "rados_object": object_data[0],
+                    "bucket": bucket_name,
+                    "user_object": object_data[2],
+                    "poolidx": 0
+                }
+                op_queue.put(op_obj)
 
-                self.in_flight.append({"stat_op": self.ceph.async_stat_datapool_object(object_data[0],0), "rados_object": object_data[0], "bucket": bucket_name, "user_object": object_data[2], "poolidx": 0})
-
-                while len(self.in_flight) >= self.max_inflight:
-                    res = self.check_aio_result(self.in_flight.popleft())
-                    if isinstance(res, dict):
-                        self.in_flight.append(res)
-
-        while len(self.in_flight):
-            res = self.check_aio_result(self.in_flight.popleft())
-            if isinstance(res, dict):
-                self.in_flight.append(res)
+        # Signal completion to thread and wait
+        op_queue.put(None)
+        processor_thread.join()
 
         self.write_result_object(bucket_name, final = True)
 
