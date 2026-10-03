@@ -552,7 +552,7 @@ class CephGapScanner:
 
         logger.critical("Deleting sync objects...")
         try:
-            ceph.sync_ioctl.stat(self.SYNC_OBJECT_NAME)
+            self.ceph.stat_syncpool_object(self.SYNC_OBJECT_NAME)
         except rados.ObjectNotFound:
             pass
         else:
