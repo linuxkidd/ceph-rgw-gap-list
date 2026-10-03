@@ -418,6 +418,7 @@ class CephGapScanner:
         self.bucket_gap_count = 0
         self.bucket_gap_results_obj_count = 0
         self.bucket_object_count = 0
+        self.bucket_objects_processed = 0
         self.ceph = localceph
         self.gap_header_data = None
         self.json = False
@@ -527,10 +528,10 @@ class CephGapScanner:
             rados_obj_count (int): Count of RADOS objects processed
             qsize (int): The number of RADOS stat calls in queue
         """
-        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "bucket_object_count": self.bucket_object_count, 
-                        "rados_obj_count": rados_obj_count, "gap_count": self.bucket_gap_count, 
-                        "bucket_counter": self.processed_bucket_count, "queue_size": qsize, "total_buckets": self.total_bucket_count, 
-                        "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
+        sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "bucket_object_count": self.bucket_object_count,
+                        "bucket_objects_processed": self.bucket_objects_processed, "rados_obj_count": rados_obj_count, 
+                        "gap_count": self.bucket_gap_count, "bucket_counter": self.processed_bucket_count, "queue_size": qsize, 
+                        "total_buckets": self.total_bucket_count, "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
         self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{self.MYHOST}.{self.MYPID}" , json.dumps(sync_state))
 
     def rm_sync_state(self) -> None:
@@ -670,7 +671,8 @@ class CephGapScanner:
         self.delete_gap_objects([ bucket_name ])
         shardid = self.hash_bucket_name(bucket_name)
         logger.debug("Setting bucket start metadata to sync shard %i", shardid)
-        sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "bucket_object_count": self.bucket_object_count, 
+        sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "bucket_object_count": self.bucket_object_count,
+                         "bucket_objects_processed": self.bucket_objects_processed,
                          "rados_obj_count": 0, "gap_count": 0, "start_time": round(time.time(),3), 
                          "end_time": 0, "match": match }
         self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(sync_metadata))
@@ -699,6 +701,24 @@ class CephGapScanner:
         logger.debug("Bucket metadata not present.")
         return False
 
+    def update_bucket(self, bucket_name: str, data: Dict = None) -> None:
+        """
+        Update the bucket metadata object with the provide K/V data provided.
+
+        Args:
+            bucket_name (str): Name of the bucket that was processed
+            data (dict): KV data to add/update
+        """
+        shardid = self.hash_bucket_name(bucket_name)
+        logger.info("Setting bucket end metadata for %s to sync shard %i", bucket_name, shardid)
+        bucket_meta = self.get_bucket_meta(bucket_name)
+        if bucket_meta:
+            bucket_meta.update( data )
+            logger.debug("Bucket meta: %s", bucket_meta)
+            self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(bucket_meta))
+        else:
+            logger.error("Bucket start metadata for %s is missing from shard %i", bucket_name, shardid)
+
     def end_bucket(self, bucket_name: str, rados_obj_count: int) -> None:
         """
         Mark the completion of processing a specified bucket.
@@ -707,19 +727,12 @@ class CephGapScanner:
             bucket_name (str): Name of the bucket that was processed
             rados_obj_count (int): Count of RADOS objects processed
         """
-        shardid = self.hash_bucket_name(bucket_name)
-        logger.info("Setting bucket end metadata for %s to sync shard %i", bucket_name, shardid)
-        bucket_meta = self.get_bucket_meta(bucket_name)
-        if bucket_meta:
-            bucket_meta.update( { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, 
-                                 "rados_obj_count": rados_obj_count, 
-                                 "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) })
-            logger.debug("Bucket meta: %s", bucket_meta)
-            self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(bucket_meta))
-            self.touch_sync_state(bucket_name, rados_obj_count)
-        else:
-            logger.error("Bucket start metadata for %s is missing from shard %i", bucket_name, shardid)
-
+        update_data = { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, 
+                        "bucket_object_count": self.bucket_object_count, "rados_obj_count": rados_obj_count,
+                        "bucket_objects_processed": self.bucket_objects_processed,
+                        "total_time_secs": round(round(time.time(),3) - bucket_meta["start_time"],3) }
+        self.update_bucket(bucket_name, update_data)
+        self.touch_sync_state(bucket_name, rados_obj_count)
         self.bucket_gap_count = 0
 
     def is_bucket_scanning(self, bucket_name: str) -> bool:
@@ -971,7 +984,10 @@ class CephGapScanner:
                     print(f"  {host} ( {len(data.items())} processes )")
                     for pid,status in data.items():
                         dt = datetime.fromtimestamp(status['epoch']).strftime('%Y-%m-%d %H:%M:%S')
-                        print(f"    PID: {pid}, Bucket: {status['current_bucket']}, Object Count: {status.get('bucket_object_count',0)}, Rados Count: {status['rados_obj_count']}, QD: {status['queue_size']}, Gap Count: {status['gap_count']}, Bucket Counter: {status['bucket_counter']}, Last Updated: {dt}")
+                        pct_complete = 0
+                        if status.get('bucket_object_count',0)>0:
+                            pct_complete = status.get('bucket_objects_processed',0)/status.get('bucket_object_count',99999999999999) * 100
+                        print(f"    PID: {pid}, {status['current_bucket']}, User Objects: {status.get('bucket_objects_processed',0)}/{status.get('bucket_object_count',0)} ({pct_complete:0.1f}%), Rados Count: {status['rados_obj_count']}, QD: {status['queue_size']}, Gap Count: {status['gap_count']}, Bucket Counter: {status['bucket_counter']}, Last Updated: {dt}")
                         host_processed += status['bucket_counter']
                         total_processed += status['bucket_counter']
                     print(f"  Host processed: {host_processed}")
@@ -982,18 +998,19 @@ class CephGapScanner:
             if len(bucket_state):
                 print("\nBucket State:")
                 for bucket_name,data in bucket_state.items():
-                    print(f"  {bucket_name}:: Object Count: {data.get('bucket_object_count',0)}, Rados Count: {data['rados_obj_count']}, ", end="")
-                    if data['end_time']:
+                    output_line = f"  {bucket_name}:: Object Count: ({data.get('bucket_objects_processed',0)}/{data.get('bucket_object_count',0)}), Rados Count: {data['rados_obj_count']}, "
+                    if data.get('end_time',0):
                         dt = datetime.fromtimestamp(data['end_time']).strftime('%Y-%m-%d %H:%M:%S')
                         hum = self.seconds_to_human(data['total_time_secs'])
                         scope = f" (prefix: '{data['match']}')" if data.get('match') else ""
-                        print(f"Last Scan Completed: {dt} in {hum}, found {data['gap_count']} gaps{scope}.")
-                    elif data['start_time']:
+                        output_line += f"Last Scan Completed: {dt} in {hum}, found {data['gap_count']} gaps{scope}."
+                    elif data.get('start_time',0):
                         dt = datetime.fromtimestamp(data['start_time']).strftime('%Y-%m-%d %H:%M:%S')
                         state = "never completed, process not running"
                         if data['hostname'] in running_hosts and str(data['pid']) in running_hosts[data['hostname']]:
                             state = f"active on host {data['hostname']} (pid: {data['pid']})"
-                        print(f"Scan Started: {dt} ({state})")
+                        output_line += f"Scan Started: {dt} ({state})"
+                    print(output_line)
             else:
                 print("  No bucket state available.")
 
@@ -1014,14 +1031,12 @@ class CephGapScanner:
         seconds = round(secs % 60,3)
         parts = []
         if days:
-            parts.append(f"{days} d")
-        if hours:
-            parts.append(f"{hours} h")
-        if minutes:
-            parts.append(f"{minutes} m")
-        if seconds > 0:
-            parts.append(f"{seconds} s")
-        return " ".join(parts)
+            parts.append(f"{days}d")
+        if hours or minutes or seconds:
+            parts.append(f"{hours:02d}")
+            parts.append(f"{minutes:02d}")
+            parts.append(f"{seconds:02.3f}")
+        return ":".join(parts)
 
     def check_aio_result(self, op_obj: Dict) -> Union[Dict, None]:
         """
@@ -1078,6 +1093,8 @@ class CephGapScanner:
         """
         bucket_meta = None
         self.bucket_object_count=0
+        self.bucket_objects_processed=0
+        last_user_object_processed=None
 
         if not force_scan:
             logger.info("Checking %s via sync state", bucket_name)
@@ -1133,6 +1150,7 @@ class CephGapScanner:
             return None
 
         self.bucket_object_count=bucket_stats['usage']['rgw.main']['num_objects']
+        self.update_bucket(bucket_name, { "bucket_object_count": self.bucket_object_count } )
         self.touch_sync_state(bucket_name, 0, 0)
 
         # Initialize thread-safe queue to manage in-flight operations natively
@@ -1163,6 +1181,10 @@ class CephGapScanner:
                 object_data = brl_line.strip().split(self.FIELD_SEPARATOR)
                 if self.match and not object_data[2].startswith(self.match):
                     continue
+
+                if object_data[2] != last_user_object_processed:
+                    self.bucket_objects_processed += 1
+                    last_user_object_processed=object_data[2]
 
                 bucket_rados_obj_count += 1
                 if bucket_rados_obj_count % self.report_every_x_object_count == 0:
@@ -1360,15 +1382,19 @@ if __name__ == "__main__":
             scanner.match = args.match
             scanner.max_age = max(0,int(args.maxage))
             scanner.json = args.json
-
-            if args.gaps:
-                scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
-            elif args.report:
-                scanner.generate_report()
-            elif args.delete:
-                scanner.delete_gap_objects()
-                scanner.delete_sync_objects()
-            elif args.verify:
-                scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list, verify=True)
-            else:
-                scanner.process_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
+            try:
+                if args.gaps:
+                    scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
+                elif args.report:
+                    scanner.generate_report()
+                elif args.delete:
+                    scanner.delete_gap_objects()
+                    scanner.delete_sync_objects()
+                elif args.verify:
+                    scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list, verify=True)
+                else:
+                    scanner.process_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
+            except BrokenPipeError:
+                # Redirect stdout to /dev/null to avoid a second BrokenPipeError at exit
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, sys.stdout.fileno())
