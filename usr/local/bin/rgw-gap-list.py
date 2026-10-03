@@ -3,9 +3,15 @@
 """
 By: Michael J. Kidd (linuxkidd)
 Last Revision: 2026-10-02
-Version: 4.0
+Version: 5.0
 
-Now storing results in RADOS
+## Major version change log
+v5: Now multi-threaded ( submit / process )
+v4: Now storing results in RADOS
+v3: Now using async io
+v2: Now in Python, performing RADOS stat on the backing objects
+v1: Initial shell script, has performance limitations due to long running
+    listing processes.
 
 Performs a Rados Gateway Gap analysis
 
@@ -307,12 +313,12 @@ class CephClusterConnection:
             self.sync_ioctl.operate_write_op(write_op, object_name)
 
     def read_syncpool_omap_vals(self, object_name: str) -> Dict:
-        """ 
-        Read all omap key/value pairs from an object in the sync pool 
-        
+        """
+        Read all omap key/value pairs from an object in the sync pool
+
         Args:
             object_name (str): Name of the object to read omap data from
-    
+
         Returns:
             Dict: Dictionary of key, value pairs
         """
@@ -359,9 +365,9 @@ class CephClusterConnection:
         return kvdata
 
     def read_syncpool_omap_vals_by_keys(self, object_name: str = "", key_list: Tuple = () ) -> Dict:
-        """ 
+        """
         Read the omap key, value pair(s) for a given object and key(s) in the sync pool
-        
+
         Args:
             object_name (str): Name of the object to write omap data to
             key_list (tuple): Name(s) of the omap key(s) to return
@@ -382,9 +388,9 @@ class CephClusterConnection:
         return results
 
     def remove_syncpool_omap_keys(self, object_name: str = "", key_list: List = None) -> None:
-        """ 
-        Remove omap key, value pair(s) from a given object in the sync pool 
-        
+        """
+        Remove omap key, value pair(s) from a given object in the sync pool
+
         Args:
             object_name (str): Name of the object to write omap data to
             key_list (list): Name of the omap key(s) to remove
@@ -404,7 +410,7 @@ class CephClusterConnection:
 class CephGapScanner:
     """
     A class to handle scanning a validating data consistency between the RADOS Gateway bucket index
-    and the backing data pools.  Specifically, it checks that all RADOS objects referenced in the 
+    and the backing data pools.  Specifically, it checks that all RADOS objects referenced in the
     bucket index exist in RADOS.
     """
     def __init__(self, localceph: CephClusterConnection) -> None:
@@ -1069,7 +1075,6 @@ class CephGapScanner:
         self.processed_bucket_count += 1
 
         bucket_rados_obj_count = 0
-        processed_count = 0
         starttime = laststatus = round(time.time(),3)
         self.start_bucket(bucket_name,self.match)
 
@@ -1090,7 +1095,6 @@ class CephGapScanner:
                 self.in_flight.append({"stat_op": self.ceph.async_stat_datapool_object(object_data[0],0), "rados_object": object_data[0], "bucket": bucket_name, "user_object": object_data[2], "poolidx": 0})
 
                 while len(self.in_flight) >= self.max_inflight:
-                    processed_count += 1
                     res = self.check_aio_result(self.in_flight.popleft())
                     if isinstance(res, dict):
                         self.in_flight.append(res)
@@ -1196,19 +1200,19 @@ if __name__ == "__main__":
     """
     Main entry point for the rgw-gap-list tool.
 
-    This script performs gap analysis on Ceph RGW S3 buckets by comparing
-    RADOS object listings with bucket index data to identify missing objects.
+    This script performs gap analysis on Ceph RGW S3 buckets by by stat'ing
+    all RADOS objects which are referenced by bucket index entries to
+    identify missing objects.
 
     The script supports various modes of operation:
-    - Gap detection and reporting
-    - Bucket status reporting
-    - Result verification
-    - Sync state management
+    - Gap detection and process state reporting
+    - Result reporting and verification
 
     Command line arguments control the behavior of the gap scanner, including
     which buckets to process, how to filter results, and where to store synchronization
     data.
     """
+
     parser = argparse.ArgumentParser(description="Multi-run / Multi-host capable rgw-gap-list tool")
     parser.add_argument("-a", "--maxage",  default = 7*86400, type=int, help="Maximum age (in seconds) of last scan before rescan is forced.  Default 7 days.")
     parser.add_argument("-b", "--bucketlist",  default = '', help="Optional: Bucket(s) to operate on, default is all buckets, quoted space separated list is supported. Supercedes -l.")
