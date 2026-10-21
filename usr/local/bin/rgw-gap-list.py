@@ -734,7 +734,7 @@ class CephGapScanner:
         self.touch_sync_state(bucket_name, rados_obj_count)
         self.bucket_gap_count = 0
 
-    def is_bucket_scanning(self, bucket_name: str) -> bool:
+    def is_bucket_scanning(self, bucket_name: str) -> Union[ Dict, bool ]:
         """
         Check if a bucket is currently being scanned by another process.
 
@@ -742,7 +742,8 @@ class CephGapScanner:
             bucket_name (str): Name of the bucket to check
 
         Returns:
-            bool: True if bucket is being scanned by another process, False otherwise
+            Dict | bool : Running host data if bucket is being scanned, False otherwise
+
         """
         running_hosts = self.get_other_running_hosts(bucket_keyed=True)
         if bucket_name in running_hosts:
@@ -762,9 +763,14 @@ class CephGapScanner:
         """
         running_hosts = {}
         running_hosts_raw = self.ceph.read_syncpool_omap_vals(self.SYNC_OBJECT_NAME)
+        stale_host_seconds = self.report_every_x_object_count * ( 120 / 10000 )
+        # 2 minutes per 10k object count report interval
 
         for key, value in running_hosts_raw.items():
             if key == f"{self.MYHOST}.{self.MYPID}":
+                continue
+            if value.epoch < time.time() - stale_host_seconds:
+                # If the host has not updated the sync state, consider it stale / dead.
                 continue
             key_parts = key.strip().split(".")
             remote_host = key_parts[0]
@@ -1099,7 +1105,7 @@ class CephGapScanner:
             logger.info("Checking %s via sync state", bucket_name)
             is_scanning = self.is_bucket_scanning(bucket_name)
             if is_scanning:
-                logger.info("Bucket %s is actively being scanned on %s (%i)", bucket_name, is_scanning['hostname'], is_scanning['pid'])
+                logger.info("Bucket %s is actively being scanned on %s (%i)", bucket_name, is_scanning['hostname'], int(is_scanning['pid']))
                 return None
 
         bucket_meta = self.get_bucket_meta(bucket_name)
@@ -1350,27 +1356,30 @@ if __name__ == "__main__":
 
     bucket_list = []
     exclude_bucket_list = []
+    BUCKET_NAME_RE = re.compile(
+        r"^([a-zA-Z0-9][a-zA-Z0-9._-]*/)?[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$"
+    )
 
     if args.excludelist:
-        exclude_bucket_list = [ bn for bn in args.excludelist.split(" ") if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",bn) ]
+        exclude_bucket_list = [ bn for bn in args.excludelist.split(" ") if BUCKET_NAME_RE.match(bn) ]
         if len(exclude_bucket_list) == 0:
             logger.critical("The provided exclude bucket list did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
     elif args.excludefile:
         with open(args.excludefile, encoding="utf-8") as elist:
-            exclude_bucket_list = [ line.strip() for line in elist if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",line.strip()) ]
+            exclude_bucket_list = [ line.strip() for line in elist if BUCKET_NAME_RE.match(line.strip()) ]
         if len(exclude_bucket_list) == 0:
             logger.critical("The provided exclude bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
 
     if args.bucketlist:
-        bucket_list = [ bn for bn in args.bucketlist.split(" ") if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",bn) ]
+        bucket_list = [ bn for bn in args.bucketlist.split(" ") if BUCKET_NAME_RE.match(bn) ]
         if len(bucket_list) == 0:
             logger.critical("The provided bucket list did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
     elif args.listfile:
         with open(args.listfile, encoding="utf-8") as blist:
-            bucket_list = [ line.strip() for line in blist if re.match(r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$",line.strip()) ]
+            bucket_list = [ line.strip() for line in blist if BUCKET_NAME_RE.match(line.strip()) ]
         if len(bucket_list) == 0:
             logger.critical("The provided bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
