@@ -2,8 +2,8 @@
 
 """
 By: Michael J. Kidd (linuxkidd)
-Last Revision: 2026-10-02
-Version: 5.0
+Last Revision: 2026-10-22
+Version: 5.1
 
 ## Major version change log
 v5: Now multi-threaded ( separate submit / process threads )
