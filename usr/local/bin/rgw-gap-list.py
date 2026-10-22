@@ -419,6 +419,7 @@ class CephGapScanner:
         self.bucket_gap_results_obj_count = 0
         self.bucket_object_count = 0
         self.bucket_objects_processed = 0
+        self.bucket_objects_with_gaps = 0
         self.ceph = localceph
         self.gap_header_data = None
         self.json = False
@@ -530,7 +531,8 @@ class CephGapScanner:
         """
         sync_state = { "epoch": round(time.time(),3), "current_bucket": bucket_name, "bucket_object_count": self.bucket_object_count,
                         "bucket_objects_processed": self.bucket_objects_processed, "rados_obj_count": rados_obj_count, 
-                        "gap_count": self.bucket_gap_count, "bucket_counter": self.processed_bucket_count, "queue_size": qsize, 
+                        "bucket_objects_with_gaps": self.bucket_objects_with_gaps, "gap_count": self.bucket_gap_count, 
+                        "bucket_counter": self.processed_bucket_count, "queue_size": qsize, 
                         "total_buckets": self.total_bucket_count, "bucket_gap_results_obj_count": self.bucket_gap_results_obj_count }
         self.ceph.write_syncpool_omap(self.SYNC_OBJECT_NAME, f"{self.MYHOST}.{self.MYPID}" , json.dumps(sync_state))
 
@@ -622,6 +624,7 @@ class CephGapScanner:
         """
         logger.debug("Adding gap for s3://%s/%s :: %s", bucket_name, object_name, rados_object)
         if object_name not in self.results:
+            self.bucket_objects_with_gaps += 1
             self.results[object_name]={ "epoch": round(time.time(), 3), "missing_rados_objects": [ ] }
         self.results[object_name]["missing_rados_objects"].append(rados_object)
         self.bucket_gap_count += 1
@@ -673,6 +676,7 @@ class CephGapScanner:
         logger.debug("Setting bucket start metadata to sync shard %i", shardid)
         sync_metadata = { "hostname": self.MYHOST, "pid": self.MYPID, "bucket_object_count": self.bucket_object_count,
                          "bucket_objects_processed": self.bucket_objects_processed,
+                         "bucket_objects_with_gaps": self.bucket_objects_with_gaps,
                          "rados_obj_count": 0, "gap_count": 0, "start_time": round(time.time(),3), 
                          "end_time": 0, "match": match }
         self.ceph.write_syncpool_omap(f"{self.SYNC_OBJECT_NAME}.{shardid}", bucket_name, json.dumps(sync_metadata))
@@ -729,7 +733,8 @@ class CephGapScanner:
         """
         update_data = { "end_time": round(time.time(),3), "gap_count": self.bucket_gap_count, 
                         "bucket_object_count": self.bucket_object_count, "rados_obj_count": rados_obj_count,
-                        "bucket_objects_processed": self.bucket_objects_processed }
+                        "bucket_objects_processed": self.bucket_objects_processed,
+                        "bucket_objects_with_gaps": self.bucket_objects_with_gaps }
         self.update_bucket(bucket_name, update_data)
         self.touch_sync_state(bucket_name, rados_obj_count)
         self.bucket_gap_count = 0
@@ -769,9 +774,10 @@ class CephGapScanner:
         for key, value in running_hosts_raw.items():
             if key == f"{self.MYHOST}.{self.MYPID}":
                 continue
-            if value.epoch < time.time() - stale_host_seconds:
+            if value.get('epoch',time.time()) < time.time() - stale_host_seconds:
                 # If the host has not updated the sync state, consider it stale / dead.
                 continue
+
             key_parts = key.strip().split(".")
             remote_host = key_parts[0]
             remote_pid = key_parts[-1]
@@ -1006,9 +1012,9 @@ class CephGapScanner:
                     output_line = f"  {bucket_name}:: Object Count: ({data.get('bucket_objects_processed',0)}/{data.get('bucket_object_count',0)}), Rados Count: {data['rados_obj_count']}, "
                     if data.get('end_time',0):
                         dt = datetime.fromtimestamp(data['end_time']).strftime('%Y-%m-%d %H:%M:%S')
-                        hum = self.seconds_to_human(data['total_time_secs'])
+                        hum = self.seconds_to_human(data.get('total_time_secs',0))
                         scope = f" (prefix: '{data['match']}')" if data.get('match') else ""
-                        output_line += f"Last Scan Completed: {dt} in {hum}, found {data['gap_count']} gaps{scope}."
+                        output_line += f"Last Scan Completed: {dt} in {hum}, found {data.get('bucket_objects_with_gaps',0)} S3 / {data.get('gap_count',0)} rados gaps{scope}."
                     elif data.get('start_time',0):
                         dt = datetime.fromtimestamp(data['start_time']).strftime('%Y-%m-%d %H:%M:%S')
                         state = "never completed, process not running"
@@ -1097,9 +1103,10 @@ class CephGapScanner:
             force_scan (bool): Whether to force scanning even if recently scanned
         """
         bucket_meta = None
-        self.bucket_object_count=0
-        self.bucket_objects_processed=0
-        last_user_object_processed=None
+        self.bucket_object_count = 0
+        self.bucket_objects_processed = 0
+        self.bucket_objects_with_gaps = 0
+        last_user_object_processed = None
 
         if not force_scan:
             logger.info("Checking %s via sync state", bucket_name)
@@ -1145,12 +1152,14 @@ class CephGapScanner:
                 logger.debug("Bucket %s has zero objects.  Skipping.", bucket_name)
                 now_time = round(time.time(),3)
                 self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time)
+                self.update_bucket(bucket_name, { "total_time_secs": round(now_time - start_time,3)})
                 self.end_bucket(bucket_name,bucket_rados_obj_count)
                 return None
         except KeyError:
             logger.debug("Bucket %s has zero objects. Skipping.", bucket_name)
             now_time = round(time.time(),3)
             self.output_status(bucket_name, bucket_rados_obj_count, now_time - start_time, now_time - last_status_time)
+            self.update_bucket(bucket_name, { "total_time_secs": round(now_time - start_time,3)})
             self.end_bucket(bucket_name,bucket_rados_obj_count)
             return None
 
