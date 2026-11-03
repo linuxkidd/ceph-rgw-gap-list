@@ -1028,12 +1028,12 @@ class CephGapScanner:
 
     def prometheus_exporter(self):
         from collections import defaultdict
-        MP   = re.compile(r'__multipart_|__shadow_')
 
         def esc(v):
             return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
         def classify(oid,object_name):
+            MP   = re.compile(r'__multipart_|__shadow_')
             if MP.search(oid):
                 return "multipart_tail"
             if oid.endswith("_" + object_name):
@@ -1061,7 +1061,7 @@ class CephGapScanner:
             for object_name, object_data in list(gap_results[bucket_name].items()):
                 newest = max(newest, object_data['epoch'])
                 for rados_object in list(object_data["missing_rados_objects"]):
-                    kind = classify(object_name,rados_object)
+                    kind = classify(rados_object,object_name)
                     affected[(bucket_name, kind)].add(object_name)
                     missing[(bucket_name, kind)] += 1
 
