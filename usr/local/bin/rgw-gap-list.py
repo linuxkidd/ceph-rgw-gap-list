@@ -2,10 +2,11 @@
 
 """
 By: Michael J. Kidd (linuxkidd)
-Last Revision: 2026-10-22
-Version: 5.1
+Last Revision: 2026-11-03
+Version: 5.2
 
 ## Major version change log
+v5.2: Added prometheus exporter
 v5: Now multi-threaded ( separate submit / process threads )
 v4: Now storing results in RADOS
 v3: Now using async io
@@ -1025,6 +1026,78 @@ class CephGapScanner:
             else:
                 print("  No bucket state available.")
 
+    def prometheus_exporter(self):
+        from collections import defaultdict
+        MP   = re.compile(r'__multipart_|__shadow_')
+
+        def esc(v):
+            return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+        def classify(oid,object_name):
+            if MP.search(oid):
+                return "multipart_tail"
+            if oid.endswith("_" + object_name):
+                return "head"
+            return "other"
+
+        for obj in [self.SYNC_OBJECT_NAME, self.RESULTS_OBJECT_NAME]:
+            if not self.ceph.stat_syncpool_object(obj):
+                logger.critical("Sync / Results object found: %s.  Exiting", obj)
+                sys.exit(1)
+            logger.debug("Found primary sync / results object: %s", obj)
+
+        newest = 0
+        gap_results = {}
+        affected = defaultdict(set)
+        missing = defaultdict(int)
+        running_hosts = self.get_other_running_hosts()
+        bucket_state = self.get_buckets_state()
+
+        bucket_list = list(self.read_gap_header(cache = True))
+
+        for bucket_name in bucket_list:
+            gap_results[bucket_name] = self.read_gap_results(bucket_name, cache=True)
+
+            for object_name, object_data in list(gap_results[bucket_name].items()):
+                newest = max(newest, object_data['epoch'])
+                for rados_object in list(object_data["missing_rados_objects"]):
+                    kind = classify(object_name,rados_object)
+                    affected[(bucket_name, kind)].add(object_name)
+                    missing[(bucket_name, kind)] += 1
+
+        out = []
+        out.append("# HELP rgw_gap_s3_objects_affected Distinct S3 objects with at least one missing rados object")
+        out.append("# TYPE rgw_gap_s3_objects_affected gauge")
+        for (b, k), s in sorted(affected.items()):
+            out.append(f'rgw_gap_s3_objects_affected{{bucket="{esc(b)}",kind="{k}"}} {len(s)}')
+        out.append("# HELP rgw_gap_rados_objects_missing Missing rados objects referenced by RGW manifests")
+        out.append("# TYPE rgw_gap_rados_objects_missing gauge")
+        for (b, k), n in sorted(missing.items()):
+            out.append(f'rgw_gap_rados_objects_missing{{bucket="{esc(b)}",kind="{k}"}} {n}')
+        out.append("# TYPE rgw_gap_results_mtime_seconds gauge")
+        out.append(f'rgw_gap_results_mtime_seconds{int(newest)}')
+
+        states = defaultdict(int)
+        last_done = 0
+        now = time.time()
+        for bname, st in bucket_state.items():
+            if st.get("end_time"):
+                last_done = max(last_done, st["end_time"])
+                states["stale" if now - st["end_time"] > 7 * 86400 else "completed"] += 1
+            else:
+                states["running_or_dead"] += 1
+        out.append("# TYPE rgw_gap_scan_buckets gauge")
+        for s, n in states.items():
+            out.append(f'rgw_gap_scan_buckets{{state="{s}"}} {n}')
+        out.append("# TYPE rgw_gap_scan_last_completed_seconds gauge")
+        out.append(f'rgw_gap_scan_last_completed_seconds {int(last_done)}')
+        out.append("# TYPE rgw_gap_scan_active_hosts gauge")
+        out.append(f'rgw_gap_scan_active_hosts {len(running_hosts)}')
+
+        print("\n".join(out))
+
+        return
+
     def seconds_to_human(self, secs: float) -> str:
         """
         Convert seconds to a human-readable time format.
@@ -1344,6 +1417,7 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--norandom", default = False, action="store_true", help="By default, the script randomizes the list of buckets before processing.  On large bucket count environments, this may cause significant delay before start of processing due to the way the randomizing occurs.  Set '-n' to Not Randomize the list to remove this delay.")
     parser.add_argument("--namespace", default = 'rgw-gap-list', help="What namespace to use for sync / results objects. Default: rgw-gap-list")
     parser.add_argument("-p", "--pool", default = 'default.rgw.buckets.data default.rgw.buckets.non-ec', help="Bucket Data Pool(s), default 'default.rgw.buckets.data default.rgw.buckets.non-ec', quoted space separated list is supported.")
+    parser.add_argument("--promexport",  default = False, action="store_true", help="Prometheus Export.  All other processing and output options are ignored if this flag is specified.")
     parser.add_argument("-s", "--syncpool", default = 'default.rgw.buckets.index', help="Synchronization / Queuing pool for the script to use, default 'default.rgw.buckets.index'.")
     parser.add_argument("-r", "--report",  default = False, action="store_true", help="Generate bucket scrub metadata report.")
     parser.add_argument("-j", "--json",  default = False, action="store_true", help="Use JSON format for bucket scrub metadata report. Only considered with -g, -r and -x")
@@ -1401,7 +1475,9 @@ if __name__ == "__main__":
             scanner.max_age = max(0,int(args.maxage))
             scanner.json = args.json
             try:
-                if args.gaps:
+                if args.promexport:
+                    scanner.prometheus_exporter()
+                elif args.gaps:
                     scanner.generate_gap_list(bucket_list = bucket_list, exclude_bucket_list = exclude_bucket_list)
                 elif args.report:
                     scanner.generate_report()
