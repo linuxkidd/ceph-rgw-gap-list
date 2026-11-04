@@ -1493,7 +1493,6 @@ if __name__ == "__main__":
             sync_pool=args.syncpool,
             namespace=args.namespace
             ) as ceph:
-        ceph.namespace = args.namespace.strip()
         with CephGapScanner(ceph) as scanner:
             scanner.max_inflight = max(args.inflight,1)
             scanner.match = args.match
