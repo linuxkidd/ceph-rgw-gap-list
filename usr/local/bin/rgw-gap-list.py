@@ -1153,7 +1153,7 @@ class CephGapScanner:
             results.append(stat_op.get_return_value())
 
         if len(results) > 0 and results.count(0) == 0:
-            if op_obj['poolidx'] == 0 and len(self.pool_ioctl) > 1:
+            if op_obj['poolidx'] == 0 and len(self.ceph.pool_ioctl) > 1:
                 logger.info("%s not found in default pool, checking remaining pools.", op_obj['rados_object'])
                 stat_ops = self.ceph.async_stat_datapool_object(op_obj['rados_object'],1)
                 if len(stat_ops):
