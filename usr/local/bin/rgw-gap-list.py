@@ -2,10 +2,11 @@
 
 """
 By: Michael J. Kidd (linuxkidd)
-Last Revision: 2026-11-03
-Version: 5.2
+Last Revision: 2026-11-04
+Version: 5.3
 
 ## Major version change log
+v5.3: Add client name/keyring support
 v5.2: Added prometheus exporter
 v5: Now multi-threaded ( separate submit / process threads )
 v4: Now storing results in RADOS
@@ -109,11 +110,15 @@ class CephClusterConnection:
     A context manager to handle connecting to and disconnecting from a
     Ceph RADOS cluster, ensuring resources are cleaned up properly.
     """
-    def __init__(self, ceph_conf: str = '/etc/ceph/ceph.conf',
+    def __init__(self, ceph_conf: str = '/etc/ceph/ceph.conf', 
+                 client_name: str = None, 
+                 client_keyring: str = None, 
                  pool_names: List = None,
                  sync_pool: str = None) -> None:
         self.ceph_conf = ceph_conf
         self.cluster = None
+        self.client_name = client_name
+        self.client_keyring = client_keyring
         self.pool_names = pool_names
         self.pool_ioctl = []
         self.sync_pool = sync_pool
@@ -130,7 +135,10 @@ class CephClusterConnection:
         Returns:
             CephClusterConnection: The instance itself for use in 'with' statements
         """
-        self.cluster = rados.Rados(conffile=self.ceph_conf)
+        self.cluster = rados.Rados(
+            conffile=self.ceph_conf,
+            name=self.client_name,
+            conf={'keyring': self.client_keyring})
         try:
             self.cluster.connect()
             logger.info("Successfully connected to the Ceph cluster.")
@@ -233,8 +241,10 @@ class CephClusterConnection:
         if idx is not None:
             if idx == 0:
                 idxend = 1
-            elif idx >= 1:
+            elif idx >= 1 and len(self.pool_ioctl) > 1:
                 idxstart = idx
+            else:
+                return stat_ops
 
         for myidx in range(idxstart,idxend):
             stat_ops.append(self.pool_ioctl[myidx].aio_stat(object_name,self.null_cb))
@@ -1143,10 +1153,16 @@ class CephGapScanner:
             results.append(stat_op.get_return_value())
 
         if len(results) > 0 and results.count(0) == 0:
-            if op_obj['poolidx'] == 0:
+            if op_obj['poolidx'] == 0 and len(self.pool_ioctl) > 1:
                 logger.info("%s not found in default pool, checking remaining pools.", op_obj['rados_object'])
-                op_obj.update({'stat_op': self.ceph.async_stat_datapool_object(op_obj['rados_object'],1), 'poolidx': 1 })
-                return op_obj
+                stat_ops = self.ceph.async_stat_datapool_object(op_obj['rados_object'],1)
+                if len(stat_ops):
+                    op_obj.update({'stat_op': stat_ops, 'poolidx': 1 })
+                    return op_obj
+                else:
+                    logger.info("No remaining pool checks returned, %s not found.", op_obj['rados_object'])
+                    self.add_result_entry(bucket_name=op_obj['bucket'], object_name=op_obj['user_object'], rados_object=op_obj['rados_object'])
+                    logger.debug("[NOT FOUND] s3://%s/%s MISSING %s", op_obj['bucket'], op_obj['user_object'], op_obj['rados_object'])
 
             self.add_result_entry(bucket_name=op_obj['bucket'], object_name=op_obj['user_object'], rados_object=op_obj['rados_object'])
             logger.debug("[NOT FOUND] s3://%s/%s MISSING %s", op_obj['bucket'], op_obj['user_object'], op_obj['rados_object'])
@@ -1409,6 +1425,8 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--excludelist",  default = '', help="Optional: Bucket(s) to skip, default is process all buckets, quoted space separated list is supported. Supercedes -f.")
     parser.add_argument("-f", "--excludefile", default = '', help="Optional: File with list of bucket(s) to skip, should be one bucket name per line.")
     parser.add_argument("-c", "--conf", default = '/etc/ceph/ceph.conf', help="Ceph conf file to use, default '/etc/ceph/ceph.conf'")
+    parser.add_argument("--ceph_client_name", default = 'client.admin', help="Ceph client name to use, default 'client.admin'")
+    parser.add_argument("--ceph_client_keyring", default = '/etc/ceph/ceph.client.admin.keyring', help="Ceph client keyring to use, default '/etc/ceph/ceph.client.admin.keyring'")
     parser.add_argument("-d", "--delete",  default = False, action="store_true", help="Remove all sync objects and Exit. Used to clear all syncronized bucket status data.")
     parser.add_argument("-g", "--gaps",  default = False, action="store_true", help="Dump the gap results from RADOS object contents.  All other options are ignore ( except -j )")
     parser.add_argument("-i", "--inflight",  default = 15000, type=int, help="Maximum number of in-flight ops to allow without a response.  Default: 15000")
@@ -1467,7 +1485,7 @@ if __name__ == "__main__":
             logger.critical("The provided bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
 
-    with CephClusterConnection(ceph_conf=args.conf, pool_names=args.pool.split(" "), sync_pool=args.syncpool) as ceph:
+    with CephClusterConnection(ceph_conf=args.conf, client_name=args.ceph_client_name, client_keyring=args.ceph_client_keyring, pool_names=args.pool.split(" "), sync_pool=args.syncpool) as ceph:
         ceph.namespace = args.namespace.strip()
         with CephGapScanner(ceph) as scanner:
             scanner.max_inflight = max(args.inflight,1)

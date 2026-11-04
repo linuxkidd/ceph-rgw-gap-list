@@ -28,6 +28,12 @@ Optional: File with list of bucket(s) to skip, should be one bucket name per lin
 \fB\-c CONF, \-\-conf CONF\fR
 Ceph conf file to use, default '/etc/ceph/ceph.conf'.
 .TP
+\fB\-\-ceph_client_name CLIENT_NAME\fR
+Ceph Client Name to use, default 'client.admin'.
+.TP
+\fB\-\-ceph_client_keyring CLIENT_KEYRING\fR
+Ceph Client Keyring file to use, default '/etc/ceph/ceph.client.admin.keyring'.
+.TP
 \fB\-d, \-\-delete\fR
 Remove all sync and results objects then Exit. Used to clear all tool generated data.
 .TP
@@ -51,6 +57,9 @@ What namespace to use for sync / results objects. Default: rgw-gap-list.
 .TP
 \fB\-p POOL, \-\-pool POOL\fR
 Bucket Data Pool(s), default 'default.rgw.buckets.data default.rgw.buckets.non-ec', quoted space separated list is supported.
+.TP
+\fB\-\-promexport\fR
+Prometheus Export.  All other processing and output options are ignored if this flag is specified.
 .TP
 \fB\-s SYNCPOOL, \-\-syncpool SYNCPOOL\fR
 Synchronization / Queuing pool for the script ot use, default 'default.rgw.buckets.index'.
