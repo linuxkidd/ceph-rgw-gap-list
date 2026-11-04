@@ -3,7 +3,7 @@
 """
 By: Michael J. Kidd (linuxkidd)
 Last Revision: 2026-11-04
-Version: 5.3
+Version: 5.4
 
 ## Major version change log
 v5.3: Add client name/keyring support
@@ -114,7 +114,8 @@ class CephClusterConnection:
                  client_name: str = None, 
                  client_keyring: str = None, 
                  pool_names: List = None,
-                 sync_pool: str = None) -> None:
+                 sync_pool: str = None,
+                 namespace: str = None) -> None:
         self.ceph_conf = ceph_conf
         self.cluster = None
         self.client_name = client_name
@@ -123,7 +124,7 @@ class CephClusterConnection:
         self.pool_ioctl = []
         self.sync_pool = sync_pool
         self.sync_ioctl = None
-        self.namespace = "rgw-gap-list"
+        self.namespace = namespace
 
     def __enter__(self):
         """
@@ -437,7 +438,6 @@ class CephGapScanner:
         self.match = ""
         self.max_age = 7 * 86400
         self.max_inflight = 15000
-        self.namespace = "rgw-gap-list"
         self.processed_bucket_count = 0
         self.report_every_x_object_count = 10000
         self.results = {}
@@ -1485,7 +1485,14 @@ if __name__ == "__main__":
             logger.critical("The provided bucket list file did not contain any valid bucket names.  Please confirm proper s3 bucket names are present.")
             sys.exit(1)
 
-    with CephClusterConnection(ceph_conf=args.conf, client_name=args.ceph_client_name, client_keyring=args.ceph_client_keyring, pool_names=args.pool.split(" "), sync_pool=args.syncpool) as ceph:
+    with CephClusterConnection(
+            ceph_conf=args.conf, 
+            client_name=args.ceph_client_name, 
+            client_keyring=args.ceph_client_keyring, 
+            pool_names=args.pool.split(" "), 
+            sync_pool=args.syncpool,
+            namespace=args.namespace
+            ) as ceph:
         ceph.namespace = args.namespace.strip()
         with CephGapScanner(ceph) as scanner:
             scanner.max_inflight = max(args.inflight,1)
