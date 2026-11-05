@@ -1,9 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 
 """
 By: Michael J. Kidd (linuxkidd)
-Last Revision: 2026-11-04
-Version: 5.4
+Last Revision: 2026-11-05
+Version: 5.5
 
 ## Major version change log
 v5.3: Add client name/keyring support
