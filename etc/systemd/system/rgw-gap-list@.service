@@ -5,7 +5,7 @@ Description=Ceph RGW Gap List Tool %i
 Type=oneshot
 User=root
 EnvironmentFile=/etc/default/rgw-gap-list
-ExecStart=/usr/local/bin/rgw-gap-list.py $OPTS
+ExecStart=/usr/bin/rgw-gap-list.py $OPTS
 
 [Install]
 WantedBy=multi-user.target
